@@ -1,7 +1,6 @@
 package lock
 
 import (
-	"sync"
 	"time"
 
 	"6.5840/kvsrv1/rpc"
@@ -9,88 +8,93 @@ import (
 )
 
 type Lock struct {
-	// IKVClerk is a go interface for k/v clerks: the interface hides
-	// the specific Clerk type of ck but promises that ck supports
-	// Put and Get.  The tester passes the clerk in when calling
-	// MakeLock().
-	ck                  kvtest.IKVClerk
-	mu                  sync.Mutex
-	lockStateKey        string
-	lockStateValue      string
-	lockStateKeyVersion rpc.Tversion
+	ck    kvtest.IKVClerk
+	key   string // The key in the k/v store that represents the lock
+	value string // The unique value for this lock holder
 }
 
-// The tester calls MakeLock() and passes in a k/v clerk; your code can
-// perform a Put or Get by calling lk.ck.Put() or lk.ck.Get().
-//
-// Use l as the key to store the "lock state" (you would have to decide
-// precisely what the lock state is).
+// MakeLock creates a new lock instance.
+// It initializes the lock key in the store if it doesn't exist.
 func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 	lk := &Lock{
-		ck:           ck,
-		lockStateKey: l,
+		ck:    ck,
+		key:   l,
+		value: kvtest.RandValue(8), // A unique ID for this client's lock instance
 	}
+
+	// Attempt to initialize the lock key in the store.
+	// It's okay if it already exists (ErrVersion).
+	// We loop in case of network errors.
 	for {
-		err := ck.Put(l, "", 0)
-		if err == rpc.OK || err == rpc.ErrVersion {
+		_, _, err := ck.Get(l)
+		if err == rpc.ErrNoKey {
+			// Key doesn't exist, try to create it.
+			err = ck.Put(l, "", 0)
+			if err == rpc.OK || err == rpc.ErrVersion {
+				break // Success or another client created it.
+			}
+		} else if err == rpc.OK {
+			// Key already exists, which is fine.
 			break
 		}
+		// On ErrMaybe or other transient errors, just retry.
+		time.Sleep(10 * time.Millisecond)
 	}
+
 	return lk
 }
 
+// Acquire attempts to acquire the lock, blocking until successful.
+// It implements a test-and-set spinlock.
 func (lk *Lock) Acquire() {
-	lk.mu.Lock()
-	defer func() {
-		lk.mu.Unlock()
-	}()
 	for {
-		randValue := kvtest.RandValue(8)
-		state, version, err := lk.ck.Get(lk.lockStateKey)
-		if err != rpc.OK {
-			panic("lock state key removed")
-		}
-		if state == "" {
-			lk.lockStateValue = randValue
-			err = lk.ck.Put(lk.lockStateKey, randValue, version)
-			if err == rpc.OK {
-				lk.lockStateKeyVersion = version + 1
-				break
+		// Test: Read the current lock state.
+		state, version, err := lk.ck.Get(lk.key)
+
+		// If the lock is free (state is empty), try to set it.
+		if err == rpc.OK && state == "" {
+			// Set: Attempt to write our unique value into the lock key.
+			// This is an atomic test-and-set operation.
+			putErr := lk.ck.Put(lk.key, lk.value, version)
+			if putErr == rpc.OK {
+				// Success! We acquired the lock.
+				return
 			}
-		} else if state == lk.lockStateValue {
-			lk.lockStateKeyVersion = version
-			break
+			// If putErr is ErrVersion, another client got the lock first.
+			// If putErr is ErrMaybe, we might have the lock. The loop will
+			// re-check on the next iteration.
+		} else if err == rpc.OK && state == lk.value {
+			// We already hold the lock (e.g., from a previous attempt
+			// where the reply was lost).
+			return
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		// Wait before retrying to avoid busy-spinning.
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
+// Release releases the lock.
+// It only succeeds if this client is the current lock holder.
 func (lk *Lock) Release() {
-	lk.mu.Lock()
-	defer func() {
-		lk.mu.Unlock()
-	}()
-
 	for {
-		state, version, err := lk.ck.Get(lk.lockStateKey)
-		_ = version
-		if err == rpc.OK {
-			if state == "" || state != lk.lockStateValue {
-				break
+		state, version, err := lk.ck.Get(lk.key)
+
+		// Only release the lock if we are the one holding it.
+		if err == rpc.OK && state == lk.value {
+			putErr := lk.ck.Put(lk.key, "", version)
+			if putErr == rpc.OK || putErr == rpc.ErrVersion {
+				// Success, or someone else already took the lock after us.
+				// In either case, we are no longer the holder.
+				return
 			}
-		} else {
-			panic("lock state key removed")
+			// On ErrMaybe, loop and retry to ensure it's released.
+		} else if err == rpc.OK {
+			// We are not the holder, so there's nothing to do.
+			return
 		}
-		err = lk.ck.Put(lk.lockStateKey, "", lk.lockStateKeyVersion)
-		if err == rpc.ErrNoKey {
-			panic("lock state key removed")
-		}
-		if err == rpc.ErrVersion {
-			panic("cannot release lock")
-		}
-		if err == rpc.OK {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+
+		// On Get errors, wait and retry.
+		time.Sleep(10 * time.Millisecond)
 	}
 }
