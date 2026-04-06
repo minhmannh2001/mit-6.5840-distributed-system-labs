@@ -83,7 +83,7 @@ func (lk *Lock) Release() {
 		// Only release the lock if we are the one holding it.
 		if err == rpc.OK && state == lk.value {
 			putErr := lk.ck.Put(lk.key, "", version)
-			if putErr == rpc.OK || putErr == rpc.ErrVersion {
+			if putErr == rpc.OK {
 				// Success, or someone else already took the lock after us.
 				// In either case, we are no longer the holder.
 				return
