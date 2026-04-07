@@ -3,6 +3,7 @@ package raft
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"6.5840/labrpc"
 	"6.5840/raftapi"
@@ -135,5 +136,135 @@ func TestPeer_Part1(t *testing.T) {
 				rf.currentTerm, rf.votedFor, rf.role)
 		}
 		rf.mu.Unlock()
+	})
+}
+
+// TestPeer_Part2 covers RequestVote: one vote per term + election restriction (Figure 2, §5.4.1).
+func TestPeer_Part2_RequestVote(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reject_stale_term", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 7
+		rf.votedFor = -1
+		rf.mu.Unlock()
+
+		reply := &RequestVoteReply{}
+		rf.RequestVote(&RequestVoteArgs{Term: 4, CandidateId: 1, LastLogIndex: 0, LastLogTerm: 0}, reply)
+		if reply.VoteGranted || reply.Term != 7 {
+			t.Fatalf("want reject stale; got granted=%v term=%d", reply.VoteGranted, reply.Term)
+		}
+	})
+
+	t.Run("one_vote_per_term_second_candidate_denied", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 2
+		rf.votedFor = -1
+		rf.mu.Unlock()
+
+		rf.RequestVote(&RequestVoteArgs{Term: 2, CandidateId: 0, LastLogIndex: 0, LastLogTerm: 0}, &RequestVoteReply{})
+		r2 := &RequestVoteReply{}
+		rf.RequestVote(&RequestVoteArgs{Term: 2, CandidateId: 1, LastLogIndex: 0, LastLogTerm: 0}, r2)
+		if r2.VoteGranted {
+			t.Fatal("second different candidate must not get vote in same term")
+		}
+	})
+
+	t.Run("same_candidate_retry_still_granted", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		args := &RequestVoteArgs{Term: 3, CandidateId: 2, LastLogIndex: 0, LastLogTerm: 0}
+		rA, rB := &RequestVoteReply{}, &RequestVoteReply{}
+		rf.RequestVote(args, rA)
+		rf.RequestVote(args, rB)
+		if !rA.VoteGranted || !rB.VoteGranted {
+			t.Fatalf("same candidate retries should grant; A=%v B=%v", rA.VoteGranted, rB.VoteGranted)
+		}
+	})
+
+	t.Run("deny_when_candidate_last_term_behind", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.votedFor = -1
+		rf.log = []LogEntry{{Term: 0}, {Term: 1}, {Term: 5}}
+		rf.mu.Unlock()
+
+		reply := &RequestVoteReply{}
+		rf.RequestVote(&RequestVoteArgs{Term: 1, CandidateId: 1, LastLogIndex: 1, LastLogTerm: 1}, reply)
+		if reply.VoteGranted {
+			t.Fatal("candidate with older last log term must not get vote")
+		}
+	})
+
+	t.Run("deny_when_same_last_term_but_shorter_log", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.votedFor = -1
+		rf.log = []LogEntry{{Term: 0}, {Term: 3}, {Term: 3}, {Term: 3}}
+		rf.mu.Unlock()
+
+		reply := &RequestVoteReply{}
+		rf.RequestVote(&RequestVoteArgs{Term: 1, CandidateId: 1, LastLogIndex: 1, LastLogTerm: 3}, reply)
+		if reply.VoteGranted {
+			t.Fatal("candidate with same last term but shorter log must not get vote")
+		}
+	})
+
+	t.Run("grant_when_candidate_log_up_to_date", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.votedFor = -1
+		rf.log = []LogEntry{{Term: 0}, {Term: 3}, {Term: 3}, {Term: 3}}
+		rf.mu.Unlock()
+
+		reply := &RequestVoteReply{}
+		rf.RequestVote(&RequestVoteArgs{Term: 1, CandidateId: 1, LastLogIndex: 3, LastLogTerm: 3}, reply)
+		if !reply.VoteGranted {
+			t.Fatal("candidate at least as up-to-date should get vote when eligible")
+		}
+	})
+
+	t.Run("higher_rpc_term_steps_down_then_grants_if_log_ok", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.role = RoleCandidate
+		rf.votedFor = rf.me
+		rf.log = []LogEntry{{Term: 0}}
+		rf.mu.Unlock()
+
+		reply := &RequestVoteReply{}
+		rf.RequestVote(&RequestVoteArgs{Term: 4, CandidateId: 2, LastLogIndex: 0, LastLogTerm: 0}, reply)
+		if !reply.VoteGranted || reply.Term != 4 {
+			t.Fatalf("want grant after stepping to new term; granted=%v term=%d", reply.VoteGranted, reply.Term)
+		}
+		rf.mu.Lock()
+		if rf.votedFor != 2 {
+			t.Fatalf("votedFor = %d, want 2", rf.votedFor)
+		}
+		rf.mu.Unlock()
+	})
+
+	t.Run("grant_vote_pushes_election_deadline_forward", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.votedFor = -1
+		rf.electionDeadline = time.Now().Add(-time.Hour)
+		rf.mu.Unlock()
+
+		before := time.Now()
+		rf.RequestVote(&RequestVoteArgs{Term: 1, CandidateId: 0, LastLogIndex: 0, LastLogTerm: 0}, &RequestVoteReply{})
+
+		rf.mu.Lock()
+		deadline := rf.electionDeadline
+		rf.mu.Unlock()
+		if !deadline.After(before) {
+			t.Fatalf("election deadline should be reset to future on grant; deadline=%v before=%v", deadline, before)
+		}
 	})
 }

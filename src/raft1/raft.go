@@ -28,6 +28,12 @@ const (
 	RoleLeader
 )
 
+// LogEntry is one Raft log entry (Figure 2). Index 0 is a dummy entry (term 0).
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -40,6 +46,12 @@ type Raft struct {
 	currentTerm int      // latest term this server has seen
 	votedFor    int      // candidateId that received vote in current term, or -1 if none
 	role        RaftRole // follower, candidate, or leader
+
+	// log[0] is unused dummy; real entries start at 1 (3B+).
+	log []LogEntry
+
+	// electionDeadline is when a follower/candidate may start a new election (3A ticker).
+	electionDeadline time.Time
 }
 
 // return currentTerm and whether this server
@@ -64,6 +76,33 @@ func (rf *Raft) becomeFollower(newTerm int) {
 		rf.votedFor = -1
 	}
 	rf.role = RoleFollower
+}
+
+// lastLogIndex returns index of last log entry (>= 0). Caller must hold rf.mu.
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.log) - 1
+}
+
+// lastLogTerm returns term of last log entry. Caller must hold rf.mu.
+func (rf *Raft) lastLogTerm() int {
+	return rf.log[len(rf.log)-1].Term
+}
+
+// isLogUpToDate reports whether a candidate's log is at least as current as ours (§5.4.1).
+// Caller must hold rf.mu.
+func (rf *Raft) isLogUpToDate(lastLogIndex, lastLogTerm int) bool {
+	myLastTerm := rf.lastLogTerm()
+	myLastIdx := rf.lastLogIndex()
+	if lastLogTerm != myLastTerm {
+		return lastLogTerm > myLastTerm
+	}
+	return lastLogIndex >= myLastIdx
+}
+
+// resetElectionTimerLocked picks a new random election deadline. Caller must hold rf.mu.
+func (rf *Raft) resetElectionTimerLocked() {
+	ms := 300 + rand.Int63n(300)
+	rf.electionDeadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
 }
 
 // save Raft's persistent state to stable storage,
@@ -164,10 +203,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	reply.Term = rf.currentTerm
 
-	// Election restriction (3B): grant if log at least as up-to-date; empty log OK for 3A.
+	if !rf.isLogUpToDate(args.LastLogIndex, args.LastLogTerm) {
+		reply.VoteGranted = false
+		return
+	}
+
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
+		rf.resetElectionTimerLocked()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -186,6 +230,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.becomeFollower(args.Term)
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	rf.resetElectionTimerLocked()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -298,11 +343,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.role = RoleFollower
+	rf.log = []LogEntry{{Term: 0}}
 
 	// Your initialization code here (3B, 3C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.mu.Lock()
+	rf.resetElectionTimerLocked()
+	rf.mu.Unlock()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
