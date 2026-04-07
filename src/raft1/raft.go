@@ -50,6 +50,22 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.role == RoleLeader
 }
 
+// becomeFollower adopts a term >= current term and becomes follower (Figure 2).
+// If newTerm > currentTerm, updates currentTerm and clears votedFor.
+// If newTerm == currentTerm, only demotes to follower (e.g. valid heartbeat).
+// If newTerm < currentTerm, does nothing (callers should reject stale RPCs first).
+// Caller must hold rf.mu.
+func (rf *Raft) becomeFollower(newTerm int) {
+	if newTerm < rf.currentTerm {
+		return
+	}
+	if newTerm > rf.currentTerm {
+		rf.currentTerm = newTerm
+		rf.votedFor = -1
+	}
+	rf.role = RoleFollower
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -135,12 +151,41 @@ type AppendEntriesReply struct {
 
 // RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	}
+	reply.Term = rf.currentTerm
+
+	// Election restriction (3B): grant if log at least as up-to-date; empty log OK for 3A.
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
 }
 
 // AppendEntries RPC handler (heartbeats in 3A; log entries in 3B).
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	rf.becomeFollower(args.Term)
+	reply.Term = rf.currentTerm
+	reply.Success = true
 }
 
 // example code to send a RequestVote RPC to a server.
