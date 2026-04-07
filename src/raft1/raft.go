@@ -28,6 +28,30 @@ const (
 	RoleLeader
 )
 
+// Timing and tuning (3A). Keep magic numbers here instead of scattered in methods.
+const (
+	// electionTimeout is chosen uniformly from [base, base+range) milliseconds.
+	electionTimeoutBaseMs  int64 = 300
+	electionTimeoutRangeMs int64 = 300
+
+	// heartbeatInterval: lab caps heartbeats at ~10/s → interval ≥ ~100 ms.
+	heartbeatInterval = 120 * time.Millisecond
+
+	// ticker sleeps when not leader: coarse poll for election deadline.
+	tickerFollowerPollSleep = 10 * time.Millisecond
+	// brief yield after startElection so vote RPCs can complete before next tick.
+	tickerPostElectionSleep = time.Millisecond
+
+	noVote = -1 // rf.votedFor when this server has not voted in currentTerm
+
+	// RPC names registered with labrpc (must match handler methods).
+	rpcRequestVote   = "Raft.RequestVote"
+	rpcAppendEntries = "Raft.AppendEntries"
+
+	// Start() return index until log replication exists (3B).
+	startIndexNotReady = -1
+)
+
 // LogEntry is one Raft log entry (Figure 2). Index 0 is a dummy entry (term 0).
 type LogEntry struct {
 	Term    int
@@ -73,7 +97,7 @@ func (rf *Raft) becomeFollower(newTerm int) {
 	}
 	if newTerm > rf.currentTerm {
 		rf.currentTerm = newTerm
-		rf.votedFor = -1
+		rf.votedFor = noVote
 	}
 	rf.role = RoleFollower
 }
@@ -101,7 +125,7 @@ func (rf *Raft) isLogUpToDate(lastLogIndex, lastLogTerm int) bool {
 
 // resetElectionTimerLocked picks a new random election deadline. Caller must hold rf.mu.
 func (rf *Raft) resetElectionTimerLocked() {
-	ms := 300 + rand.Int63n(300)
+	ms := electionTimeoutBaseMs + rand.Int63n(electionTimeoutRangeMs)
 	rf.electionDeadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
 }
 
@@ -208,7 +232,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	if rf.votedFor == noVote || rf.votedFor == args.CandidateId {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.resetElectionTimerLocked()
@@ -263,13 +287,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	ok := rf.peers[server].Call(rpcRequestVote, args, reply)
 	return ok
 }
 
 // sendAppendEntries sends an AppendEntries RPC to a server.
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	ok := rf.peers[server].Call(rpcAppendEntries, args, reply)
 	return ok
 }
 
@@ -341,7 +365,9 @@ func (rf *Raft) startElection() {
 	}
 }
 
-// broadcastAppendEntries sends heartbeats to all peers (3A). Does not hold rf.mu across RPCs.
+// broadcastAppendEntries sends AppendEntries heartbeats to every other peer (Part 5 / 3A).
+// Copies term under rf.mu, then issues RPCs without holding rf.mu.
+// On reply.Term > currentTerm, steps down to follower.
 func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
 	if rf.role != RoleLeader {
@@ -389,7 +415,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return -1, rf.currentTerm, rf.role == RoleLeader
+	return startIndexNotReady, rf.currentTerm, rf.role == RoleLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -419,8 +445,7 @@ func (rf *Raft) ticker() {
 
 		if role == RoleLeader {
 			rf.broadcastAppendEntries()
-			// Lab 3A: at most ~10 heartbeats/s → ≥ ~100 ms between rounds.
-			time.Sleep(120 * time.Millisecond)
+			time.Sleep(heartbeatInterval)
 			continue
 		}
 
@@ -432,12 +457,12 @@ func (rf *Raft) ticker() {
 		if time.Now().After(rf.electionDeadline) {
 			rf.mu.Unlock()
 			rf.startElection()
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(tickerPostElectionSleep)
 			continue
 		}
 		rf.mu.Unlock()
 
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(tickerFollowerPollSleep)
 	}
 }
 
@@ -464,7 +489,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	rf.currentTerm = 0
-	rf.votedFor = -1
+	rf.votedFor = noVote
 	rf.role = RoleFollower
 	rf.log = []LogEntry{{Term: 0}}
 

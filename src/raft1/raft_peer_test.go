@@ -393,7 +393,8 @@ func TestPeer_Part3_AppendEntries(t *testing.T) {
 }
 
 // unitTestRaftCluster wires n Raft peers through labrpc (reliable). Cleanup kills all rafts.
-func unitTestRaftCluster(tb testing.TB, n int) []*Raft {
+// The returned Network can be used with GetCount(serverName) for heartbeat / RPC assertions.
+func unitTestRaftCluster(tb testing.TB, n int) ([]*Raft, *labrpc.Network) {
 	tb.Helper()
 	rn := labrpc.MakeNetwork()
 	rn.Reliable(true)
@@ -433,7 +434,7 @@ func unitTestRaftCluster(tb testing.TB, n int) []*Raft {
 		}
 		rn.Cleanup()
 	})
-	return rafs
+	return rafs, rn
 }
 
 func raftServerName(i int) string {
@@ -447,7 +448,7 @@ func TestPeer_Part4_Election(t *testing.T) {
 	}
 
 	t.Run("three_peers_eventually_one_leader", func(t *testing.T) {
-		rafs := unitTestRaftCluster(t, 3)
+		rafs, _ := unitTestRaftCluster(t, 3)
 		deadline := time.Now().Add(4 * time.Second)
 		for time.Now().Before(deadline) {
 			leaders := 0
@@ -470,7 +471,7 @@ func TestPeer_Part4_Election(t *testing.T) {
 	})
 
 	t.Run("single_server_becomes_leader", func(t *testing.T) {
-		rafs := unitTestRaftCluster(t, 1)
+		rafs, _ := unitTestRaftCluster(t, 1)
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
 			_, isL := rafs[0].GetState()
@@ -480,5 +481,102 @@ func TestPeer_Part4_Election(t *testing.T) {
 			time.Sleep(15 * time.Millisecond)
 		}
 		t.Fatal("solo cluster should elect self as leader")
+	})
+}
+
+// waitSingleLeader blocks until exactly one peer reports isLeader.
+func waitSingleLeader(tb testing.TB, rafs []*Raft, maxWait time.Duration) (term int) {
+	tb.Helper()
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		leaders := 0
+		leaderTerm := 0
+		for _, rf := range rafs {
+			tm, isL := rf.GetState()
+			if isL {
+				leaders++
+				leaderTerm = tm
+			}
+		}
+		if leaders == 1 {
+			return leaderTerm
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	tb.Fatal("timeout waiting for a single leader")
+	return 0
+}
+
+// TestPeer_Part5: leader periodic AppendEntries; no lock across Call; step-down on higher term in reply (covered in Part 3 handler tests + integration).
+func TestPeer_Part5_LeaderHeartbeat(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster heartbeat test uses real time")
+	}
+
+	t.Run("follower_incoming_rpc_count_increases_while_stable", func(t *testing.T) {
+		rafs, net := unitTestRaftCluster(t, 3)
+		waitSingleLeader(t, rafs, 4*time.Second)
+		// Let post-election traffic settle so counts mostly reflect heartbeats.
+		time.Sleep(200 * time.Millisecond)
+
+		var follower int = -1
+		for i, rf := range rafs {
+			if _, isL := rf.GetState(); !isL {
+				follower = i
+				break
+			}
+		}
+		if follower < 0 {
+			t.Fatal("expected a non-leader follower")
+		}
+		sname := raftServerName(follower)
+		before := net.GetCount(sname)
+		time.Sleep(400 * time.Millisecond)
+		after := net.GetCount(sname)
+		if got := after - before; got < 2 {
+			t.Fatalf("want at least 2 incoming RPCs on follower in 400ms (heartbeats); got %d (before=%d after=%d)", got, before, after)
+		}
+	})
+
+	t.Run("stable_leader_term_unchanged_short_window", func(t *testing.T) {
+		rafs, _ := unitTestRaftCluster(t, 3)
+		term := waitSingleLeader(t, rafs, 4*time.Second)
+		time.Sleep(2 * time.Second)
+		leaders := 0
+		for _, rf := range rafs {
+			tm, isL := rf.GetState()
+			if isL {
+				leaders++
+			}
+			if tm != term {
+				t.Fatalf("term drift: want stable %d, saw %d", term, tm)
+			}
+		}
+		if leaders != 1 {
+			t.Fatalf("want 1 leader after quiet period, got %d", leaders)
+		}
+	})
+
+	t.Run("heartbeat_rate_at_most_roughly_ten_per_second", func(t *testing.T) {
+		rafs, net := unitTestRaftCluster(t, 3)
+		waitSingleLeader(t, rafs, 4*time.Second)
+		time.Sleep(200 * time.Millisecond)
+
+		follower := -1
+		for i, rf := range rafs {
+			if _, isL := rf.GetState(); !isL {
+				follower = i
+				break
+			}
+		}
+		sname := raftServerName(follower)
+		before := net.GetCount(sname)
+		time.Sleep(1200 * time.Millisecond)
+		after := net.GetCount(sname)
+		delta := after - before
+		// ~8 heartbeats/s at 120ms interval; allow slack for elections / other RPCs.
+		if delta > 14 {
+			t.Fatalf("too many incoming RPCs on follower in 1.2s: %d (lab limits ~10 heartbeats/s)", delta)
+		}
 	})
 }
