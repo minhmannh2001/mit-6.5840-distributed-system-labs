@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -273,6 +273,105 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+// startElection begins a new election if the election deadline has passed (Figure 2).
+// Does not hold rf.mu across RPCs.
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	if rf.role == RoleLeader {
+		rf.mu.Unlock()
+		return
+	}
+	if !time.Now().After(rf.electionDeadline) {
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.currentTerm++
+	rf.role = RoleCandidate
+	rf.votedFor = rf.me
+	rf.resetElectionTimerLocked()
+
+	term := rf.currentTerm
+	lastIdx := rf.lastLogIndex()
+	lastLogTerm := rf.lastLogTerm()
+	n := len(rf.peers)
+	me := rf.me
+	rf.mu.Unlock()
+
+	var votes int32 = 1
+	for peer := 0; peer < n; peer++ {
+		if peer == me {
+			continue
+		}
+		go func(p int) {
+			args := &RequestVoteArgs{
+				Term:         term,
+				CandidateId:  me,
+				LastLogIndex: lastIdx,
+				LastLogTerm:  lastLogTerm,
+			}
+			reply := &RequestVoteReply{}
+			if !rf.sendRequestVote(p, args, reply) {
+				return
+			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+				return
+			}
+			if rf.currentTerm != term || rf.role != RoleCandidate {
+				return
+			}
+			if !reply.VoteGranted {
+				return
+			}
+			if atomic.AddInt32(&votes, 1) > int32(n/2) {
+				rf.role = RoleLeader
+			}
+		}(peer)
+	}
+
+	if n == 1 {
+		rf.mu.Lock()
+		if rf.currentTerm == term && rf.role == RoleCandidate {
+			rf.role = RoleLeader
+		}
+		rf.mu.Unlock()
+	}
+}
+
+// broadcastAppendEntries sends heartbeats to all peers (3A). Does not hold rf.mu across RPCs.
+func (rf *Raft) broadcastAppendEntries() {
+	rf.mu.Lock()
+	if rf.role != RoleLeader {
+		rf.mu.Unlock()
+		return
+	}
+	term := rf.currentTerm
+	me := rf.me
+	n := len(rf.peers)
+	rf.mu.Unlock()
+
+	for p := 0; p < n; p++ {
+		if p == me {
+			continue
+		}
+		peer := p
+		go func() {
+			args := &AppendEntriesArgs{Term: term}
+			reply := &AppendEntriesReply{}
+			if !rf.sendAppendEntries(peer, args, reply) {
+				return
+			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+			}
+		}()
+	}
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -313,16 +412,32 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
+		rf.mu.Lock()
+		role := rf.role
+		rf.mu.Unlock()
 
-		// Your code here (3A)
-		// Check if a leader election should be started.
+		if role == RoleLeader {
+			rf.broadcastAppendEntries()
+			// Lab 3A: at most ~10 heartbeats/s → ≥ ~100 ms between rounds.
+			time.Sleep(120 * time.Millisecond)
+			continue
+		}
 
+		rf.mu.Lock()
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		if time.Now().After(rf.electionDeadline) {
+			rf.mu.Unlock()
+			rf.startElection()
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+		rf.mu.Unlock()
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -337,6 +452,12 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
+	labgob.Register(LogEntry{})
+	labgob.Register(RequestVoteArgs{})
+	labgob.Register(RequestVoteReply{})
+	labgob.Register(AppendEntriesArgs{})
+	labgob.Register(AppendEntriesReply{})
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister

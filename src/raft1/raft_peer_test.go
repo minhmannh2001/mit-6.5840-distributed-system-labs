@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -388,5 +389,96 @@ func TestPeer_Part3_AppendEntries(t *testing.T) {
 			t.Fatalf("leader should stay leader on stale AE; role=%v term=%d", rf.role, rf.currentTerm)
 		}
 		rf.mu.Unlock()
+	})
+}
+
+// unitTestRaftCluster wires n Raft peers through labrpc (reliable). Cleanup kills all rafts.
+func unitTestRaftCluster(tb testing.TB, n int) []*Raft {
+	tb.Helper()
+	rn := labrpc.MakeNetwork()
+	rn.Reliable(true)
+
+	endnames := make([][]string, n)
+	peers := make([][]*labrpc.ClientEnd, n)
+	for i := 0; i < n; i++ {
+		endnames[i] = make([]string, n)
+		peers[i] = make([]*labrpc.ClientEnd, n)
+		for j := 0; j < n; j++ {
+			endnames[i][j] = fmt.Sprintf("End-%d-to-%d", i, j)
+			peers[i][j] = rn.MakeEnd(endnames[i][j])
+		}
+	}
+
+	rafs := make([]*Raft, n)
+	for i := 0; i < n; i++ {
+		applyCh := make(chan raftapi.ApplyMsg, 100)
+		r := Make(peers[i], i, tester.MakePersister(), applyCh)
+		rf := r.(*Raft)
+		rafs[i] = rf
+		srv := labrpc.MakeServer()
+		srv.AddService(labrpc.MakeService(rf))
+		rn.AddServer(raftServerName(i), srv)
+	}
+
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			rn.Connect(endnames[i][j], raftServerName(j))
+			rn.Enable(endnames[i][j], true)
+		}
+	}
+
+	tb.Cleanup(func() {
+		for _, rf := range rafs {
+			rf.Kill()
+		}
+		rn.Cleanup()
+	})
+	return rafs
+}
+
+func raftServerName(i int) string {
+	return fmt.Sprintf("raft-server-%d", i)
+}
+
+// TestPeer_Part4 integration: ticker + election + leader heartbeats (stable cluster).
+func TestPeer_Part4_Election(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster election test uses real timeouts")
+	}
+
+	t.Run("three_peers_eventually_one_leader", func(t *testing.T) {
+		rafs := unitTestRaftCluster(t, 3)
+		deadline := time.Now().Add(4 * time.Second)
+		for time.Now().Before(deadline) {
+			leaders := 0
+			var term0 int
+			for i, rf := range rafs {
+				term, isL := rf.GetState()
+				if i == 0 {
+					term0 = term
+				}
+				if isL {
+					leaders++
+				}
+			}
+			if leaders == 1 && term0 >= 1 {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatal("expected exactly one leader with term >= 1 within timeout")
+	})
+
+	t.Run("single_server_becomes_leader", func(t *testing.T) {
+		rafs := unitTestRaftCluster(t, 1)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			_, isL := rafs[0].GetState()
+			if isL {
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatal("solo cluster should elect self as leader")
 	})
 }
