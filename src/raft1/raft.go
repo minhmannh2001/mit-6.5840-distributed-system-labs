@@ -48,7 +48,7 @@ const (
 	rpcRequestVote   = "Raft.RequestVote"
 	rpcAppendEntries = "Raft.AppendEntries"
 
-	// Start() return index until log replication exists (3B).
+	// Start() stubs until log replication (3B): always this index and not-ok.
 	startIndexNotReady = -1
 )
 
@@ -338,6 +338,9 @@ func (rf *Raft) startElection() {
 			if !rf.sendRequestVote(p, args, reply) {
 				return
 			}
+			if rf.killed() {
+				return
+			}
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if reply.Term > rf.currentTerm {
@@ -390,6 +393,9 @@ func (rf *Raft) broadcastAppendEntries() {
 			if !rf.sendAppendEntries(peer, args, reply) {
 				return
 			}
+			if rf.killed() {
+				return
+			}
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if reply.Term > rf.currentTerm {
@@ -412,10 +418,11 @@ func (rf *Raft) broadcastAppendEntries() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	// Your code here (3B).
+	// 3A: no agreement yet; 3B will append to log and return ok for leader.
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return startIndexNotReady, rf.currentTerm, rf.role == RoleLeader
+	_ = command
+	return startIndexNotReady, rf.currentTerm, false
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -437,6 +444,28 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// sleepUntilOrKilled sleeps for at most d but returns early if Kill() was called.
+// Lets ticker exit promptly instead of blocking a full heartbeat interval on Sleep.
+func (rf *Raft) sleepUntilOrKilled(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if rf.killed() {
+			return
+		}
+		rem := time.Until(deadline)
+		step := tickerFollowerPollSleep
+		if rem < step {
+			step = rem
+		}
+		if step > 0 {
+			time.Sleep(step)
+		}
+	}
+}
+
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -445,7 +474,7 @@ func (rf *Raft) ticker() {
 
 		if role == RoleLeader {
 			rf.broadcastAppendEntries()
-			time.Sleep(heartbeatInterval)
+			rf.sleepUntilOrKilled(heartbeatInterval)
 			continue
 		}
 
@@ -457,12 +486,12 @@ func (rf *Raft) ticker() {
 		if time.Now().After(rf.electionDeadline) {
 			rf.mu.Unlock()
 			rf.startElection()
-			time.Sleep(tickerPostElectionSleep)
+			rf.sleepUntilOrKilled(tickerPostElectionSleep)
 			continue
 		}
 		rf.mu.Unlock()
 
-		time.Sleep(tickerFollowerPollSleep)
+		rf.sleepUntilOrKilled(tickerFollowerPollSleep)
 	}
 }
 
