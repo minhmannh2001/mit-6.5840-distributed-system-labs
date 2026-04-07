@@ -19,6 +19,14 @@ import (
 	"6.5840/tester1"
 )
 
+// RaftRole is this server's role in leader election (Figure 2).
+type RaftRole int
+
+const (
+	RoleFollower RaftRole = iota
+	RoleCandidate
+	RoleLeader
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -28,20 +36,18 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (3A, 3B, 3C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
+	// Election-related state (3A+); see Figure 2.
+	currentTerm int      // latest term this server has seen
+	votedFor    int      // candidateId that received vote in current term, or -1 if none
+	role        RaftRole // follower, candidate, or leader
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.role == RoleLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -101,20 +107,39 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
+// RequestVote RPC arguments (Figure 2).
+// Field names must start with capital letters for labrpc.
 type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
+// RequestVote RPC reply.
 type RequestVoteReply struct {
-	// Your data here (3A).
+	Term        int
+	VoteGranted bool
 }
 
-// example RequestVote RPC handler.
+// AppendEntries RPC arguments (heartbeat / log replication; Figure 2).
+type AppendEntriesArgs struct {
+	Term int
+}
+
+// AppendEntries RPC reply.
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+// RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (3A, 3B).
+}
+
+// AppendEntries RPC handler (heartbeats in 3A; log entries in 3B).
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (3A, 3B).
 }
 
@@ -150,6 +175,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// sendAppendEntries sends an AppendEntries RPC to a server.
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -164,14 +195,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
-
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return -1, rf.currentTerm, rf.role == RoleLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -223,7 +250,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (3A, 3B, 3C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.role = RoleFollower
+
+	// Your initialization code here (3B, 3C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
