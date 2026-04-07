@@ -268,3 +268,125 @@ func TestPeer_Part2_RequestVote(t *testing.T) {
 		}
 	})
 }
+
+// TestPeer_Part3 covers AppendEntries heartbeats: liveness signal + term handling (Figure 2).
+func TestPeer_Part3_AppendEntries(t *testing.T) {
+	t.Parallel()
+
+	t.Run("stale_term_rejects_without_updating_follower_term", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 6
+		rf.role = RoleFollower
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{Term: 4}, reply)
+		if reply.Success || reply.Term != 6 {
+			t.Fatalf("want stale reject; Success=%v reply.Term=%d", reply.Success, reply.Term)
+		}
+		rf.mu.Lock()
+		if rf.currentTerm != 6 {
+			t.Fatalf("currentTerm = %d, want 6", rf.currentTerm)
+		}
+		rf.mu.Unlock()
+	})
+
+	t.Run("stale_term_does_not_reset_election_deadline", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 5
+		rf.role = RoleFollower
+		old := time.Now().Add(-2 * time.Hour)
+		rf.electionDeadline = old
+		rf.mu.Unlock()
+
+		rf.AppendEntries(&AppendEntriesArgs{Term: 2}, &AppendEntriesReply{})
+
+		rf.mu.Lock()
+		d := rf.electionDeadline
+		rf.mu.Unlock()
+		if !d.Equal(old) {
+			t.Fatalf("stale AppendEntries must not reset deadline; got %v want %v", d, old)
+		}
+	})
+
+	t.Run("valid_heartbeat_resets_election_deadline", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 2
+		rf.role = RoleFollower
+		rf.electionDeadline = time.Now().Add(-time.Hour)
+		rf.mu.Unlock()
+
+		before := time.Now()
+		rf.AppendEntries(&AppendEntriesArgs{Term: 2}, &AppendEntriesReply{})
+
+		rf.mu.Lock()
+		dl := rf.electionDeadline
+		rf.mu.Unlock()
+		if !dl.After(before) {
+			t.Fatalf("valid heartbeat should push deadline forward; deadline=%v before=%v", dl, before)
+		}
+	})
+
+	t.Run("valid_heartbeat_candidate_same_term_becomes_follower", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 3
+		rf.role = RoleCandidate
+		rf.votedFor = rf.me
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{Term: 3}, reply)
+		if !reply.Success {
+			t.Fatal("want Success on valid heartbeat")
+		}
+		rf.mu.Lock()
+		if rf.role != RoleFollower {
+			t.Fatalf("role = %v, want RoleFollower", rf.role)
+		}
+		rf.mu.Unlock()
+	})
+
+	t.Run("valid_heartbeat_leader_higher_rpc_term_steps_down", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.role = RoleLeader
+		rf.votedFor = rf.me
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{Term: 8}, reply)
+		if !reply.Success || reply.Term != 8 {
+			t.Fatalf("want Success and new term in reply; Success=%v Term=%d", reply.Success, reply.Term)
+		}
+		rf.mu.Lock()
+		if rf.currentTerm != 8 || rf.role != RoleFollower {
+			t.Fatalf("want term 8 follower; term=%d role=%v", rf.currentTerm, rf.role)
+		}
+		rf.mu.Unlock()
+	})
+
+	t.Run("leader_receiving_stale_ae_stays_leader", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 5
+		rf.role = RoleLeader
+		rf.votedFor = rf.me
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{Term: 3}, reply)
+		if reply.Success {
+			t.Fatal("stale AE must not succeed")
+		}
+		rf.mu.Lock()
+		if rf.role != RoleLeader || rf.currentTerm != 5 {
+			t.Fatalf("leader should stay leader on stale AE; role=%v term=%d", rf.role, rf.currentTerm)
+		}
+		rf.mu.Unlock()
+	})
+}

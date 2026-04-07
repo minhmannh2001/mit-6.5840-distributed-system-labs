@@ -218,6 +218,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 // AppendEntries RPC handler (heartbeats in 3A; log entries in 3B).
+// Valid RPC (args.Term >= currentTerm): step down to follower, reset election timer — leader is alive.
+// Stale args.Term: reject so caller learns our term; do not reset the timer.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
