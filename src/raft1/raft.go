@@ -264,10 +264,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-// AppendEntries RPC handler (heartbeats in 3A; log entries in 3B).
-// Valid RPC (args.Term >= currentTerm): step down to follower.
-// Stale args.Term: reject so caller learns our term; do not reset the timer.
-// Heartbeats use zero-value PrevLogIndex/PrevLogTerm (0,0) matching the dummy entry at log[0].
+// AppendEntries RPC handler (Figure 2): log replication + heartbeat on follower.
+// Stale term: reject without resetting election timer.
+// Prev log mismatch: reject without resetting election timer.
+// Success: truncate conflicting suffix, append entries, advance commitIndex, reset election timer.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -280,7 +280,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.becomeFollower(args.Term)
 	reply.Term = rf.currentTerm
 
-	// Reject if log doesn't contain an entry at PrevLogIndex with PrevLogTerm (Figure 2).
 	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
 		return
@@ -289,10 +288,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	// Log append / commit from LeaderCommit: Part 3B later; empty heartbeat succeeds here.
+
+	// Drop conflicting suffix, then append leader's entries (copy to avoid aliasing RPC buffer).
+	rf.log = rf.log[:args.PrevLogIndex+1]
 	if len(args.Entries) > 0 {
-		reply.Success = false
-		return
+		toAppend := make([]LogEntry, len(args.Entries))
+		copy(toAppend, args.Entries)
+		rf.log = append(rf.log, toAppend...)
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		last := rf.lastLogIndex()
+		c := args.LeaderCommit
+		if c > last {
+			c = last
+		}
+		rf.commitIndex = c
 	}
 
 	reply.Success = true
@@ -327,12 +338,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	if server < 0 || server >= len(rf.peers) || rf.peers[server] == nil {
+		return false
+	}
 	ok := rf.peers[server].Call(rpcRequestVote, args, reply)
 	return ok
 }
 
 // sendAppendEntries sends an AppendEntries RPC to a server.
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	if server < 0 || server >= len(rf.peers) || rf.peers[server] == nil {
+		return false
+	}
 	ok := rf.peers[server].Call(rpcAppendEntries, args, reply)
 	return ok
 }
@@ -410,9 +427,8 @@ func (rf *Raft) startElection() {
 	}
 }
 
-// broadcastAppendEntries sends AppendEntries heartbeats to every other peer (Part 5 / 3A).
-// Copies term under rf.mu, then issues RPCs without holding rf.mu.
-// On reply.Term > currentTerm, steps down to follower.
+// broadcastAppendEntries sends AppendEntries (heartbeats and/or log entries) to every other peer.
+// Builds PrevLogIndex/PrevLogTerm/Entries/LeaderCommit from nextIndex and log; does not hold rf.mu across Call.
 func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
 	if rf.role != RoleLeader {
@@ -422,15 +438,50 @@ func (rf *Raft) broadcastAppendEntries() {
 	term := rf.currentTerm
 	me := rf.me
 	n := len(rf.peers)
-	rf.mu.Unlock()
+	lc := rf.commitIndex
 
+	// Leader must have replication arrays (set in initLeaderReplicationLocked). Unit tests may
+	// set RoleLeader on isolated Raft without init; skip RPCs instead of panicking.
+	if rf.nextIndex == nil || len(rf.nextIndex) != n || rf.matchIndex == nil || len(rf.matchIndex) != n {
+		rf.mu.Unlock()
+		return
+	}
+
+	type aeSnap struct {
+		peer int
+		args *AppendEntriesArgs
+	}
+	var snaps []aeSnap
 	for p := 0; p < n; p++ {
 		if p == me {
 			continue
 		}
-		peer := p
+		next := rf.nextIndex[p]
+		if next < 1 {
+			next = 1
+		}
+		prev := next - 1
+		prevTerm := rf.log[prev].Term
+		rest := len(rf.log) - next
+		if rest < 0 {
+			rest = 0
+		}
+		ents := make([]LogEntry, rest)
+		copy(ents, rf.log[next:])
+		snaps = append(snaps, aeSnap{p, &AppendEntriesArgs{
+			Term:         term,
+			PrevLogIndex: prev,
+			PrevLogTerm:  prevTerm,
+			Entries:      ents,
+			LeaderCommit: lc,
+		}})
+	}
+	rf.mu.Unlock()
+
+	for _, s := range snaps {
+		peer := s.peer
+		args := s.args
 		go func() {
-			args := &AppendEntriesArgs{Term: term}
 			reply := &AppendEntriesReply{}
 			if !rf.sendAppendEntries(peer, args, reply) {
 				return
@@ -442,6 +493,21 @@ func (rf *Raft) broadcastAppendEntries() {
 			defer rf.mu.Unlock()
 			if reply.Term > rf.currentTerm {
 				rf.becomeFollower(reply.Term)
+				return
+			}
+			if rf.currentTerm != term || rf.role != RoleLeader {
+				return
+			}
+			if reply.Success {
+				last := args.PrevLogIndex + len(args.Entries)
+				if peer >= 0 && peer < len(rf.matchIndex) {
+					rf.matchIndex[peer] = last
+					rf.nextIndex[peer] = last + 1
+				}
+			} else {
+				if peer < len(rf.nextIndex) && rf.nextIndex[peer] > 1 {
+					rf.nextIndex[peer]--
+				}
 			}
 		}()
 	}

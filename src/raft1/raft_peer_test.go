@@ -546,7 +546,7 @@ func TestPeer_3B_Part1_ReplicationState(t *testing.T) {
 		}
 	})
 
-	t.Run("append_entries_non_empty_entries_rejected_until_replication", func(t *testing.T) {
+	t.Run("append_entries_non_empty_succeeds_when_prev_ok", func(t *testing.T) {
 		rf := unitTestNewRaft(t, 3, 0)
 		rf.mu.Lock()
 		rf.currentTerm = 2
@@ -556,12 +556,175 @@ func TestPeer_3B_Part1_ReplicationState(t *testing.T) {
 		reply := &AppendEntriesReply{}
 		rf.AppendEntries(&AppendEntriesArgs{
 			Term: 2, PrevLogIndex: 0, PrevLogTerm: 0,
-			Entries:      []LogEntry{{Term: 2, Command: 1}},
+			Entries:      []LogEntry{{Term: 2, Command: 42}},
 			LeaderCommit: 0,
 		}, reply)
-		if reply.Success {
-			t.Fatal("non-empty Entries should be rejected until log append is implemented")
+		if !reply.Success {
+			t.Fatal("want Success when prev matches and entries replicate")
 		}
+		rf.mu.Lock()
+		if rf.lastLogIndex() != 1 || rf.log[1].Term != 2 {
+			t.Fatalf("log after append: got len tail %+v", rf.log)
+		}
+		rf.mu.Unlock()
+	})
+}
+
+// TestPeer_3B_Part2: AppendEntries follower — prev check, truncate+append, LeaderCommit (Figure 2).
+func TestPeer_3B_Part2_AppendEntriesLog(t *testing.T) {
+	t.Parallel()
+
+	t.Run("prev_index_out_of_range_fails_no_timer_reset", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 3
+		rf.role = RoleFollower
+		old := time.Now().Add(-2 * time.Hour)
+		rf.electionDeadline = old
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term: 3, PrevLogIndex: 5, PrevLogTerm: 0, Entries: nil, LeaderCommit: 0,
+		}, reply)
+		if reply.Success {
+			t.Fatal("want failure when PrevLogIndex beyond log")
+		}
+		rf.mu.Lock()
+		if !rf.electionDeadline.Equal(old) {
+			t.Fatal("failed AppendEntries must not reset election timer")
+		}
+		rf.mu.Unlock()
+	})
+
+	t.Run("prev_term_mismatch_fails", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.role = RoleFollower
+		rf.log = []LogEntry{{Term: 0}, {Term: 1, Command: "a"}}
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term: 1, PrevLogIndex: 1, PrevLogTerm: 99, Entries: nil, LeaderCommit: 0,
+		}, reply)
+		if reply.Success {
+			t.Fatal("want failure on PrevLogTerm mismatch")
+		}
+	})
+
+	t.Run("heartbeat_empty_entries_log_unchanged_commit_updated", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 2
+		rf.role = RoleFollower
+		rf.log = []LogEntry{{Term: 0}, {Term: 2, Command: "x"}}
+		rf.commitIndex = 0
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term: 2, PrevLogIndex: 1, PrevLogTerm: 2, Entries: nil, LeaderCommit: 1,
+		}, reply)
+		if !reply.Success {
+			t.Fatal("want heartbeat success")
+		}
+		rf.mu.Lock()
+		if len(rf.log) != 2 {
+			t.Fatalf("log len = %d, want 2", len(rf.log))
+		}
+		if rf.commitIndex != 1 {
+			t.Fatalf("commitIndex = %d, want 1", rf.commitIndex)
+		}
+		rf.mu.Unlock()
+	})
+
+	t.Run("leader_commit_capped_by_follower_log_len", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.role = RoleFollower
+		rf.commitIndex = 0
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term: 1, PrevLogIndex: 0, PrevLogTerm: 0, Entries: nil, LeaderCommit: 99,
+		}, reply)
+		if !reply.Success {
+			t.Fatal("want success")
+		}
+		rf.mu.Lock()
+		if rf.commitIndex != 0 {
+			t.Fatalf("commitIndex = %d, want 0 (only dummy at 0)", rf.commitIndex)
+		}
+		rf.mu.Unlock()
+	})
+
+	t.Run("truncate_conflict_then_append", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 4
+		rf.role = RoleFollower
+		rf.log = []LogEntry{
+			{Term: 0},
+			{Term: 1, Command: "old1"},
+			{Term: 1, Command: "old2"},
+		}
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term:         4,
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			Entries: []LogEntry{
+				{Term: 4, Command: "n1"},
+				{Term: 4, Command: "n2"},
+			},
+			LeaderCommit: 0,
+		}, reply)
+		if !reply.Success {
+			t.Fatal("want success")
+		}
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if len(rf.log) != 3 {
+			t.Fatalf("len=%d want 3 (0 + 2 new)", len(rf.log))
+		}
+		if rf.log[1].Command != "n1" || rf.log[2].Command != "n2" {
+			t.Fatalf("log = %+v", rf.log)
+		}
+	})
+
+	t.Run("append_after_matching_prefix", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 2
+		rf.role = RoleFollower
+		rf.log = []LogEntry{{Term: 0}, {Term: 2, Command: "p"}}
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term:         2,
+			PrevLogIndex: 1,
+			PrevLogTerm:  2,
+			Entries:      []LogEntry{{Term: 2, Command: "q"}},
+			LeaderCommit: 2,
+		}, reply)
+		if !reply.Success {
+			t.Fatal("want success")
+		}
+		rf.mu.Lock()
+		if len(rf.log) != 3 || rf.lastLogIndex() != 2 {
+			t.Fatalf("want 3 entries, got %+v", rf.log)
+		}
+		if rf.commitIndex != 2 {
+			t.Fatalf("commitIndex=%d want 2", rf.commitIndex)
+		}
+		rf.mu.Unlock()
 	})
 }
 
