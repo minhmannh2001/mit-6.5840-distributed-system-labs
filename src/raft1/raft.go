@@ -42,13 +42,16 @@ const (
 	// brief yield after startElection so vote RPCs can complete before next tick.
 	tickerPostElectionSleep = time.Millisecond
 
+	// applier waits when no new commits (lab: avoid busy-loop).
+	applierPollSleep = 10 * time.Millisecond
+
 	noVote = -1 // rf.votedFor when this server has not voted in currentTerm
 
 	// RPC names registered with labrpc (must match handler methods).
 	rpcRequestVote   = "Raft.RequestVote"
 	rpcAppendEntries = "Raft.AppendEntries"
 
-	// Start() stubs until log replication (3B): always this index and not-ok.
+	// Start() returns this index when not leader.
 	startIndexNotReady = -1
 )
 
@@ -150,6 +153,59 @@ func (rf *Raft) initLeaderReplicationLocked() {
 	}
 }
 
+// advanceCommitIndexLocked sets commitIndex to the largest N > commitIndex such that
+// a strict majority of servers (counting the leader) have replicated N and log[N].Term == currentTerm.
+// Caller must hold rf.mu; only meaningful for RoleLeader.
+func (rf *Raft) advanceCommitIndexLocked() {
+	if rf.role != RoleLeader {
+		return
+	}
+	for n := rf.lastLogIndex(); n > rf.commitIndex; n-- {
+		if rf.log[n].Term != rf.currentTerm {
+			continue
+		}
+		cnt := 1 // this server has the entry
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			if rf.matchIndex[i] >= n {
+				cnt++
+			}
+		}
+		if cnt > len(rf.peers)/2 {
+			rf.commitIndex = n
+			return
+		}
+	}
+}
+
+// applier sends committed entries to applyCh (Figure 2). Never holds rf.mu while sending.
+func (rf *Raft) applier(applyCh chan raftapi.ApplyMsg) {
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		if rf.lastApplied >= rf.commitIndex {
+			rf.mu.Unlock()
+			time.Sleep(applierPollSleep)
+			continue
+		}
+		rf.lastApplied++
+		idx := rf.lastApplied
+		cmd := rf.log[idx].Command
+		rf.mu.Unlock()
+
+		applyCh <- raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      cmd,
+			CommandIndex: idx,
+		}
+	}
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -233,6 +289,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// Used when Success is false and Term matches leader's term: speed up nextIndex.
+	// ConflictTerm < 0: follower's log is shorter than PrevLogIndex; set nextIndex to ConflictIndex.
+	// Otherwise: first index in follower's log with term ConflictTerm; leader may jump nextIndex.
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 // RequestVote RPC handler.
@@ -282,10 +343,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
+		ct := rf.log[args.PrevLogIndex].Term
+		reply.ConflictTerm = ct
+		idx := args.PrevLogIndex
+		for idx > 0 && rf.log[idx-1].Term == ct {
+			idx--
+		}
+		reply.ConflictIndex = idx
 		return
 	}
 
@@ -431,6 +501,10 @@ func (rf *Raft) startElection() {
 // Builds PrevLogIndex/PrevLogTerm/Entries/LeaderCommit from nextIndex and log; does not hold rf.mu across Call.
 func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
+	if rf.killed() {
+		rf.mu.Unlock()
+		return
+	}
 	if rf.role != RoleLeader {
 		rf.mu.Unlock()
 		return
@@ -500,13 +574,37 @@ func (rf *Raft) broadcastAppendEntries() {
 			}
 			if reply.Success {
 				last := args.PrevLogIndex + len(args.Entries)
-				if peer >= 0 && peer < len(rf.matchIndex) {
+				if peer >= 0 && peer < len(rf.matchIndex) && last > rf.matchIndex[peer] {
 					rf.matchIndex[peer] = last
 					rf.nextIndex[peer] = last + 1
+					rf.advanceCommitIndexLocked()
 				}
-			} else {
-				if peer < len(rf.nextIndex) && rf.nextIndex[peer] > 1 {
-					rf.nextIndex[peer]--
+			} else if reply.Term == rf.currentTerm {
+				// Ignore stale failures from older RPCs (out-of-order network / concurrent AE).
+				if peer >= len(rf.nextIndex) || rf.nextIndex[peer] != args.PrevLogIndex+1 {
+					return
+				}
+				if reply.ConflictTerm < 0 {
+					rf.nextIndex[peer] = reply.ConflictIndex
+					if rf.nextIndex[peer] < 1 {
+						rf.nextIndex[peer] = 1
+					}
+				} else {
+					lastSame := 0
+					for i := len(rf.log) - 1; i > 0; i-- {
+						if rf.log[i].Term == reply.ConflictTerm {
+							lastSame = i
+							break
+						}
+					}
+					if lastSame > 0 {
+						rf.nextIndex[peer] = lastSame + 1
+					} else {
+						rf.nextIndex[peer] = reply.ConflictIndex
+					}
+					if rf.nextIndex[peer] < 1 {
+						rf.nextIndex[peer] = 1
+					}
 				}
 			}
 		}()
@@ -526,11 +624,26 @@ func (rf *Raft) broadcastAppendEntries() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	// 3A: no agreement yet; 3B will append to log and return ok for leader.
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	_ = command
-	return startIndexNotReady, rf.currentTerm, false
+	if rf.killed() {
+		t := rf.currentTerm
+		rf.mu.Unlock()
+		return startIndexNotReady, t, false
+	}
+	if rf.role != RoleLeader {
+		t := rf.currentTerm
+		rf.mu.Unlock()
+		return startIndexNotReady, t, false
+	}
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	idx := rf.lastLogIndex()
+	t := rf.currentTerm
+	rf.advanceCommitIndexLocked()
+	rf.mu.Unlock()
+
+	go rf.broadcastAppendEntries()
+
+	return idx, t, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -619,6 +732,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	labgob.Register(RequestVoteReply{})
 	labgob.Register(AppendEntriesArgs{})
 	labgob.Register(AppendEntriesReply{})
+	// Commands in Start()/log use interface{}; register concrete types tests use.
+	labgob.Register(0)
+	labgob.Register("")
 
 	rf := &Raft{}
 	rf.peers = peers
@@ -643,6 +759,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applier(applyCh)
 
 	return rf
 }

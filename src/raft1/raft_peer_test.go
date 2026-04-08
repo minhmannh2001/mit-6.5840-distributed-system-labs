@@ -401,9 +401,9 @@ func TestPeer_Part3_AppendEntries(t *testing.T) {
 	})
 }
 
-// unitTestRaftCluster wires n Raft peers through labrpc (reliable). Cleanup kills all rafts.
-// The returned Network can be used with GetCount(serverName) for heartbeat / RPC assertions.
-func unitTestRaftCluster(tb testing.TB, n int) ([]*Raft, *labrpc.Network) {
+// unitTestRaftClusterWithApplyCh wires n Raft peers through labrpc (reliable) and returns
+// each peer's applyCh so tests can assert ApplyMsg (3B Part 5).
+func unitTestRaftClusterWithApplyCh(tb testing.TB, n int) ([]*Raft, *labrpc.Network, []chan raftapi.ApplyMsg) {
 	tb.Helper()
 	rn := labrpc.MakeNetwork()
 	rn.Reliable(true)
@@ -419,10 +419,11 @@ func unitTestRaftCluster(tb testing.TB, n int) ([]*Raft, *labrpc.Network) {
 		}
 	}
 
+	applyChs := make([]chan raftapi.ApplyMsg, n)
 	rafs := make([]*Raft, n)
 	for i := 0; i < n; i++ {
-		applyCh := make(chan raftapi.ApplyMsg, 100)
-		r := Make(peers[i], i, tester.MakePersister(), applyCh)
+		applyChs[i] = make(chan raftapi.ApplyMsg, 100)
+		r := Make(peers[i], i, tester.MakePersister(), applyChs[i])
 		rf := r.(*Raft)
 		rafs[i] = rf
 		srv := labrpc.MakeServer()
@@ -443,7 +444,14 @@ func unitTestRaftCluster(tb testing.TB, n int) ([]*Raft, *labrpc.Network) {
 		}
 		rn.Cleanup()
 	})
-	return rafs, rn
+	return rafs, rn, applyChs
+}
+
+// unitTestRaftCluster wires n Raft peers through labrpc (reliable). Cleanup kills all rafts.
+// The returned Network can be used with GetCount(serverName) for heartbeat / RPC assertions.
+func unitTestRaftCluster(tb testing.TB, n int) ([]*Raft, *labrpc.Network) {
+	rafs, net, _ := unitTestRaftClusterWithApplyCh(tb, n)
+	return rafs, net
 }
 
 func raftServerName(i int) string {
@@ -726,6 +734,227 @@ func TestPeer_3B_Part2_AppendEntriesLog(t *testing.T) {
 		}
 		rf.mu.Unlock()
 	})
+}
+
+// peerLogSnapshot returns a copy of rf.log (for tests).
+func peerLogSnapshot(rf *Raft) []LogEntry {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	out := make([]LogEntry, len(rf.log))
+	copy(out, rf.log)
+	return out
+}
+
+// TestPeer_3B_Part4: Start on leader + replication so all peers share the same log (TDD for §5.3).
+func TestPeer_3B_Part4_LogReplicationCluster(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, _ := unitTestRaftCluster(t, 3)
+	waitSingleLeader(t, rafs, 5*time.Second)
+
+	var leader *Raft
+	for _, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader = rf
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatal("no leader")
+	}
+
+	for i, rf := range rafs {
+		if rf == leader {
+			continue
+		}
+		idx, _, ok := rf.Start(999)
+		if ok || idx != startIndexNotReady {
+			t.Fatalf("follower %d: Start should fail (got idx=%d ok=%v)", i, idx, ok)
+		}
+	}
+
+	if _, _, ok := leader.Start(10); !ok {
+		t.Fatal("leader Start(10) failed")
+	}
+	if _, _, ok := leader.Start(20); !ok {
+		t.Fatal("leader Start(20) failed")
+	}
+	if _, _, ok := leader.Start(30); !ok {
+		t.Fatal("leader Start(30) failed")
+	}
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		l0 := peerLogSnapshot(rafs[0])
+		if len(l0) < 4 {
+			time.Sleep(25 * time.Millisecond)
+			continue
+		}
+		match := true
+		for i := 1; i < len(rafs); i++ {
+			li := peerLogSnapshot(rafs[i])
+			if len(li) != len(l0) {
+				match = false
+				break
+			}
+			for j := 1; j < len(l0); j++ {
+				if l0[j].Term != li[j].Term || l0[j].Command != li[j].Command {
+					match = false
+					break
+				}
+			}
+			if !match {
+				break
+			}
+		}
+		if match {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	l0 := peerLogSnapshot(rafs[0])
+	t.Fatalf("logs did not converge: peer0 log=%+v", l0)
+}
+
+// assertLeaderFollowersCaughtUp checks Figure 2 replication on the leader after followers
+// have received all entries: matchIndex[i]==lastLogIndex, nextIndex[i]==lastLogIndex+1 for i != me.
+func assertLeaderFollowersCaughtUp(tb testing.TB, leader *Raft) {
+	tb.Helper()
+	leader.mu.Lock()
+	defer leader.mu.Unlock()
+	if leader.role != RoleLeader {
+		tb.Fatalf("want RoleLeader, got %v", leader.role)
+	}
+	last := leader.lastLogIndex()
+	wantNext := last + 1
+	for i := range leader.peers {
+		if i == leader.me {
+			continue
+		}
+		if leader.matchIndex[i] != last {
+			tb.Fatalf("matchIndex[%d]=%d, want %d (fully replicated)", i, leader.matchIndex[i], last)
+		}
+		if leader.nextIndex[i] != wantNext {
+			tb.Fatalf("nextIndex[%d]=%d, want %d", i, leader.nextIndex[i], wantNext)
+		}
+	}
+}
+
+// TestPeer_3B_Part4_LeaderNextMatch: after Start + heartbeat replication, leader's nextIndex/matchIndex
+// reflect successful AppendEntries (TDD for Phần 4 — §5.3 leader bookkeeping).
+func TestPeer_3B_Part4_LeaderNextMatchAfterReplication(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, _ := unitTestRaftCluster(t, 3)
+	waitSingleLeader(t, rafs, 5*time.Second)
+
+	var leader *Raft
+	for _, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader = rf
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatal("no leader")
+	}
+
+	for _, cmd := range []interface{}{11, 22, 33} {
+		if _, _, ok := leader.Start(cmd); !ok {
+			t.Fatalf("leader Start(%v) failed", cmd)
+		}
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		leader.mu.Lock()
+		ok := leader.role == RoleLeader
+		last := 0
+		if ok {
+			last = leader.lastLogIndex()
+		}
+		all := ok && last >= 3
+		if all {
+			for i := range leader.peers {
+				if i == leader.me {
+					continue
+				}
+				if leader.matchIndex[i] != last {
+					all = false
+					break
+				}
+			}
+		}
+		leader.mu.Unlock()
+		if all {
+			assertLeaderFollowersCaughtUp(t, leader)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("timeout: followers did not catch up (matchIndex)")
+}
+
+// TestPeer_3B_Part5_ApplyChCommitOrder: leader advanceCommitIndex + applier — mọi peer nhận đủ
+// ApplyMsg{CommandValid, CommandIndex 1..K} đúng thứ tự, khớp chuỗi Start trên leader (TDD Phần 5).
+func TestPeer_3B_Part5_ApplyChCommitOrder(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, _, applyChs := unitTestRaftClusterWithApplyCh(t, 3)
+	waitSingleLeader(t, rafs, 5*time.Second)
+
+	var leader *Raft
+	for _, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader = rf
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatal("no leader")
+	}
+
+	cmds := []string{"p5a", "p5b", "p5c"}
+	for _, c := range cmds {
+		if _, _, ok := leader.Start(c); !ok {
+			t.Fatalf("leader Start(%q) failed", c)
+		}
+	}
+
+	for peer := 0; peer < 3; peer++ {
+		var got []raftapi.ApplyMsg
+		deadline := time.Now().Add(6 * time.Second)
+		for len(got) < 3 {
+			if time.Now().After(deadline) {
+				t.Fatalf("peer %d: got %d ApplyMsg, want 3", peer, len(got))
+			}
+			select {
+			case m := <-applyChs[peer]:
+				if m.CommandValid {
+					got = append(got, m)
+				}
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		for j := 0; j < 3; j++ {
+			if got[j].CommandIndex != j+1 {
+				t.Fatalf("peer %d: ApplyMsg[%d].CommandIndex=%d want %d", peer, j, got[j].CommandIndex, j+1)
+			}
+			if got[j].Command != cmds[j] {
+				t.Fatalf("peer %d: got cmd %v want %q", peer, got[j].Command, cmds[j])
+			}
+		}
+	}
 }
 
 // TestPeer_Part4 integration: ticker + election + leader heartbeats (stable cluster).
