@@ -536,6 +536,8 @@ func (rf *Raft) broadcastAppendEntries() {
 		}
 		prev := next - 1
 		prevTerm := rf.log[prev].Term
+		// Incremental replication (3B Part 6 / TestRPCBytes3B): only append suffix log[next:],
+		// not the full log each heartbeat — nextIndex advances after successful AppendEntries.
 		rest := len(rf.log) - next
 		if rest < 0 {
 			rest = 0

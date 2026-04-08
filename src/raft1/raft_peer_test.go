@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -456,6 +457,57 @@ func unitTestRaftCluster(tb testing.TB, n int) ([]*Raft, *labrpc.Network) {
 
 func raftServerName(i int) string {
 	return fmt.Sprintf("raft-server-%d", i)
+}
+
+// unitTestDisconnectPeer disables all ClientEnds to/from peer pid (same idea as tester ServerGrp.DisconnectAll).
+func unitTestDisconnectPeer(net *labrpc.Network, n, pid int) {
+	for k := 0; k < n; k++ {
+		net.Enable(fmt.Sprintf("End-%d-to-%d", k, pid), false)
+		net.Enable(fmt.Sprintf("End-%d-to-%d", pid, k), false)
+	}
+}
+
+// unitTestReconnectPeer re-enables all ends for peer pid.
+func unitTestReconnectPeer(net *labrpc.Network, n, pid int) {
+	for k := 0; k < n; k++ {
+		net.Enable(fmt.Sprintf("End-%d-to-%d", k, pid), true)
+		net.Enable(fmt.Sprintf("End-%d-to-%d", pid, k), true)
+	}
+}
+
+// waitAtLeastNCommit waits until at least `atLeast` peers have commitIndex >= want.
+func waitAtLeastNCommit(tb testing.TB, rafs []*Raft, want, atLeast int) {
+	tb.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		n := 0
+		for _, rf := range rafs {
+			rf.mu.Lock()
+			ci := rf.commitIndex
+			rf.mu.Unlock()
+			if ci >= want {
+				n++
+			}
+		}
+		if n >= atLeast {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	tb.Fatalf("timeout: want >=%d peers with commitIndex>=%d", atLeast, want)
+}
+
+// assertMaxCommitIndex asserts no peer has commitIndex > maxWant (3B Part 7 — no commit past quorum).
+func assertMaxCommitIndex(tb testing.TB, rafs []*Raft, maxWant int) {
+	tb.Helper()
+	for i, rf := range rafs {
+		rf.mu.Lock()
+		ci := rf.commitIndex
+		rf.mu.Unlock()
+		if ci > maxWant {
+			tb.Fatalf("peer %d commitIndex=%d, want <= %d", i, ci, maxWant)
+		}
+	}
 }
 
 // assertLeaderReplicationFields checks Figure 2 leader invariants after election (3B Part 1).
@@ -957,6 +1009,225 @@ func TestPeer_3B_Part5_ApplyChCommitOrder(t *testing.T) {
 	}
 }
 
+// TestPeer_3B_Part6_RPCBytesLargePayload: tăng byte RPC sau N entry lớn phải ~servers×tổng payload (giống ý TestRPCBytes3B).
+// Nếu leader gửi lại toàn bộ log mỗi heartbeat, delta vượt ngưỡng.
+func TestPeer_3B_Part6_RPCBytesLargePayload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, net := unitTestRaftCluster(t, 3)
+	waitSingleLeader(t, rafs, 5*time.Second)
+
+	var leader *Raft
+	for _, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader = rf
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatal("no leader")
+	}
+
+	if _, _, ok := leader.Start("seed"); !ok {
+		t.Fatal("seed Start failed")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 1)
+
+	bytes0 := net.GetTotalBytes()
+	const payloadLen = 5000
+	iters := 10
+	var sent int64
+	for i := 0; i < iters; i++ {
+		cmd := strings.Repeat("x", payloadLen)
+		sent += int64(payloadLen)
+		if _, _, ok := leader.Start(cmd); !ok {
+			t.Fatalf("Start iteration %d failed", i)
+		}
+		waitAllServersCommitAtLeast(t, rafs, 2+i)
+	}
+
+	bytes1 := net.GetTotalBytes()
+	got := bytes1 - bytes0
+	expected := int64(len(rafs)) * sent
+	// Align with raft_test.go TestRPCBytes3B slack for RPC framing / heartbeats.
+	if got > expected+50000 {
+		t.Fatalf("too many RPC bytes: got %d, expected about %d (+50k slack); leader may be re-sending full log each tick", got, expected)
+	}
+}
+
+// TestPeer_3B_Part7_FollowerProgressiveDisconnect mirrors TestFollowerFailure3B (TDD Phần 7).
+func TestPeer_3B_Part7_FollowerProgressiveDisconnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, net := unitTestRaftCluster(t, 3)
+	waitSingleLeader(t, rafs, 5*time.Second)
+
+	var leader *Raft
+	for _, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader = rf
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatal("no leader")
+	}
+	if _, _, ok := leader.Start(101); !ok {
+		t.Fatal("Start(101)")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 1)
+
+	leader1 := -1
+	for i, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader1 = i
+			break
+		}
+	}
+	unitTestDisconnectPeer(net, 3, (leader1+1)%3)
+	time.Sleep(RaftElectionTimeout)
+
+	leader = nil
+	for _, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader = rf
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatal("no leader after first partition")
+	}
+	if _, _, ok := leader.Start(102); !ok {
+		t.Fatal("Start(102)")
+	}
+	waitAtLeastNCommit(t, rafs, 2, 2)
+	time.Sleep(RaftElectionTimeout)
+	if _, _, ok := leader.Start(103); !ok {
+		t.Fatal("Start(103)")
+	}
+	waitAtLeastNCommit(t, rafs, 3, 2)
+
+	leader2 := -1
+	for i, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader2 = i
+			break
+		}
+	}
+	unitTestDisconnectPeer(net, 3, (leader2+1)%3)
+	unitTestDisconnectPeer(net, 3, (leader2+2)%3)
+
+	idx, _, ok := rafs[leader2].Start(104)
+	if !ok || idx != 4 {
+		t.Fatalf("Start(104): idx=%d ok=%v", idx, ok)
+	}
+	time.Sleep(2 * RaftElectionTimeout)
+	assertMaxCommitIndex(t, rafs, 3)
+}
+
+// TestPeer_3B_Part7_LeaderChainDisconnect mirrors TestLeaderFailure3B (TDD Phần 7).
+func TestPeer_3B_Part7_LeaderChainDisconnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, net := unitTestRaftCluster(t, 3)
+	waitSingleLeader(t, rafs, 5*time.Second)
+
+	var leader *Raft
+	for _, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader = rf
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatal("no leader")
+	}
+	if _, _, ok := leader.Start(101); !ok {
+		t.Fatal("Start(101)")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 1)
+
+	leader1 := -1
+	for i, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader1 = i
+			break
+		}
+	}
+	unitTestDisconnectPeer(net, 3, leader1)
+	time.Sleep(2 * RaftElectionTimeout)
+
+	// Must not use the first isLeader in rafs order: the partitioned leader1 can still
+	// report leader=true locally (split brain). Only trust leaders among peers != leader1.
+	L2 := -1
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for i, rf := range rafs {
+			if i == leader1 {
+				continue
+			}
+			if _, isL := rf.GetState(); isL {
+				L2 = i
+				break
+			}
+		}
+		if L2 >= 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if L2 < 0 {
+		t.Fatal("expected leader among peers other than partitioned leader")
+	}
+	if _, _, ok := rafs[L2].Start(102); !ok {
+		t.Fatal("Start(102)")
+	}
+	waitAtLeastNCommit(t, rafs, 2, 2)
+	time.Sleep(RaftElectionTimeout)
+	if _, _, ok := rafs[L2].Start(103); !ok {
+		t.Fatal("Start(103)")
+	}
+	waitAtLeastNCommit(t, rafs, 3, 2)
+
+	// Same split-brain issue: skip leader1 (still isolated, may claim leader).
+	leader2 := -1
+	deadline2 := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline2) {
+		for i, rf := range rafs {
+			if i == leader1 {
+				continue
+			}
+			if _, isL := rf.GetState(); isL {
+				leader2 = i
+				break
+			}
+		}
+		if leader2 >= 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if leader2 < 0 {
+		t.Fatal("no current leader among connected peers")
+	}
+	unitTestDisconnectPeer(net, 3, leader2)
+
+	for i := range rafs {
+		rafs[i].Start(104)
+	}
+	time.Sleep(2 * RaftElectionTimeout)
+	assertMaxCommitIndex(t, rafs, 3)
+}
+
 // TestPeer_Part4 integration: ticker + election + leader heartbeats (stable cluster).
 func TestPeer_Part4_Election(t *testing.T) {
 	if testing.Short() {
@@ -998,6 +1269,29 @@ func TestPeer_Part4_Election(t *testing.T) {
 		}
 		t.Fatal("solo cluster should elect self as leader")
 	})
+}
+
+// waitAllServersCommitAtLeast waits until every peer has commitIndex >= want (3B Part 5/6 helpers).
+func waitAllServersCommitAtLeast(tb testing.TB, rafs []*Raft, want int) {
+	tb.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		ok := true
+		for _, rf := range rafs {
+			rf.mu.Lock()
+			ci := rf.commitIndex
+			rf.mu.Unlock()
+			if ci < want {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	tb.Fatalf("timeout waiting for all servers commitIndex>=%d", want)
 }
 
 // waitSingleLeader blocks until exactly one peer reports isLeader.
