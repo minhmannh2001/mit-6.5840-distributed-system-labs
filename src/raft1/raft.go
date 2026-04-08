@@ -74,6 +74,14 @@ type Raft struct {
 	// log[0] is unused dummy; real entries start at 1 (3B+).
 	log []LogEntry
 
+	// Volatile state on all servers (Figure 2).
+	commitIndex int // index of highest log entry known to be committed
+	lastApplied int // index of highest log entry applied to state machine
+
+	// Volatile state on leaders; reinitialized after election (Figure 2).
+	nextIndex  []int // for each server, index of next log entry to send
+	matchIndex []int // for each server, index of highest log entry known replicated
+
 	// electionDeadline is when a follower/candidate may start a new election (3A ticker).
 	electionDeadline time.Time
 }
@@ -127,6 +135,19 @@ func (rf *Raft) isLogUpToDate(lastLogIndex, lastLogTerm int) bool {
 func (rf *Raft) resetElectionTimerLocked() {
 	ms := electionTimeoutBaseMs + rand.Int63n(electionTimeoutRangeMs)
 	rf.electionDeadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
+}
+
+// initLeaderReplicationLocked sets nextIndex and matchIndex after winning election (Figure 2).
+// Caller must hold rf.mu; rf.role should already be RoleLeader.
+func (rf *Raft) initLeaderReplicationLocked() {
+	n := len(rf.peers)
+	rf.nextIndex = make([]int, n)
+	rf.matchIndex = make([]int, n)
+	next := rf.lastLogIndex() + 1
+	for i := 0; i < n; i++ {
+		rf.nextIndex[i] = next
+		rf.matchIndex[i] = 0
+	}
 }
 
 // save Raft's persistent state to stable storage,
@@ -200,7 +221,12 @@ type RequestVoteReply struct {
 
 // AppendEntries RPC arguments (heartbeat / log replication; Figure 2).
 type AppendEntriesArgs struct {
-	Term int
+	Term         int
+	LeaderId     int // unused in minimal 3B; reserved for follower redirects / tests
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 // AppendEntries RPC reply.
@@ -239,8 +265,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 // AppendEntries RPC handler (heartbeats in 3A; log entries in 3B).
-// Valid RPC (args.Term >= currentTerm): step down to follower, reset election timer — leader is alive.
+// Valid RPC (args.Term >= currentTerm): step down to follower.
 // Stale args.Term: reject so caller learns our term; do not reset the timer.
+// Heartbeats use zero-value PrevLogIndex/PrevLogTerm (0,0) matching the dummy entry at log[0].
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -252,6 +279,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.becomeFollower(args.Term)
 	reply.Term = rf.currentTerm
+
+	// Reject if log doesn't contain an entry at PrevLogIndex with PrevLogTerm (Figure 2).
+	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+	// Log append / commit from LeaderCommit: Part 3B later; empty heartbeat succeeds here.
+	if len(args.Entries) > 0 {
+		reply.Success = false
+		return
+	}
+
 	reply.Success = true
 	rf.resetElectionTimerLocked()
 }
@@ -352,6 +395,7 @@ func (rf *Raft) startElection() {
 			}
 			if atomic.AddInt32(&votes, 1) > int32(n/2) {
 				rf.role = RoleLeader
+				rf.initLeaderReplicationLocked()
 			}
 		}(peer)
 	}
@@ -360,6 +404,7 @@ func (rf *Raft) startElection() {
 		rf.mu.Lock()
 		if rf.currentTerm == term && rf.role == RoleCandidate {
 			rf.role = RoleLeader
+			rf.initLeaderReplicationLocked()
 		}
 		rf.mu.Unlock()
 	}
@@ -518,6 +563,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = noVote
 	rf.role = RoleFollower
 	rf.log = []LogEntry{{Term: 0}}
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	// Your initialization code here (3B, 3C).
 

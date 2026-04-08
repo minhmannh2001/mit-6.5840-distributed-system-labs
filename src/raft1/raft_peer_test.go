@@ -49,6 +49,15 @@ func TestPeer_Part0(t *testing.T) {
 		if rf.me != 0 {
 			t.Fatalf("me = %d, want 0", rf.me)
 		}
+		if rf.commitIndex != 0 || rf.lastApplied != 0 {
+			t.Fatalf("commitIndex/lastApplied = (%d,%d), want (0,0)", rf.commitIndex, rf.lastApplied)
+		}
+		if len(rf.log) != 1 || rf.log[0].Term != 0 {
+			t.Fatalf("bootstrap log = %v, want single dummy term 0", rf.log)
+		}
+		if rf.nextIndex != nil || rf.matchIndex != nil {
+			t.Fatalf("follower should not have leader replication slices yet; next=%v match=%v", rf.nextIndex, rf.matchIndex)
+		}
 	})
 
 	t.Run("getState_not_leader", func(t *testing.T) {
@@ -439,6 +448,121 @@ func unitTestRaftCluster(tb testing.TB, n int) ([]*Raft, *labrpc.Network) {
 
 func raftServerName(i int) string {
 	return fmt.Sprintf("raft-server-%d", i)
+}
+
+// assertLeaderReplicationFields checks Figure 2 leader invariants after election (3B Part 1).
+func assertLeaderReplicationFields(tb testing.TB, rf *Raft, npeers int) {
+	tb.Helper()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != RoleLeader {
+		tb.Fatalf("want RoleLeader, got %v", rf.role)
+	}
+	if len(rf.nextIndex) != npeers || len(rf.matchIndex) != npeers {
+		tb.Fatalf("nextIndex/matchIndex len: got %d/%d, want %d each", len(rf.nextIndex), len(rf.matchIndex), npeers)
+	}
+	wantNext := rf.lastLogIndex() + 1
+	for i := 0; i < npeers; i++ {
+		if rf.nextIndex[i] != wantNext {
+			tb.Fatalf("nextIndex[%d] = %d, want %d (lastLogIndex+1)", i, rf.nextIndex[i], wantNext)
+		}
+		if rf.matchIndex[i] != 0 {
+			tb.Fatalf("matchIndex[%d] = %d, want 0 after election", i, rf.matchIndex[i])
+		}
+	}
+}
+
+// TestPeer_3B_Part1: Figure 2 volatile state for log/commit + leader nextIndex/matchIndex (TDD milestone).
+func TestPeer_3B_Part1_ReplicationState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("manual_leader_init_matches_figure2", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 1)
+		rf.mu.Lock()
+		rf.currentTerm = 2
+		rf.role = RoleLeader
+		rf.votedFor = rf.me
+		rf.initLeaderReplicationLocked()
+		rf.mu.Unlock()
+		assertLeaderReplicationFields(t, rf, 3)
+	})
+
+	t.Run("cluster_elected_leader_has_replication_arrays", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("uses cluster election timeouts")
+		}
+		rafs, _ := unitTestRaftCluster(t, 3)
+		waitSingleLeader(t, rafs, 4*time.Second)
+		var leader *Raft
+		for _, rf := range rafs {
+			if _, isL := rf.GetState(); isL {
+				leader = rf
+				break
+			}
+		}
+		if leader == nil {
+			t.Fatal("no leader")
+		}
+		assertLeaderReplicationFields(t, leader, 3)
+	})
+
+	t.Run("solo_leader_has_replication_arrays", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("uses cluster election timeouts")
+		}
+		rafs, _ := unitTestRaftCluster(t, 1)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, isL := rafs[0].GetState(); isL {
+				assertLeaderReplicationFields(t, rafs[0], 1)
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatal("solo server did not become leader")
+	})
+
+	t.Run("append_entries_prev_log_mismatch_rejected", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 1
+		rf.role = RoleFollower
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term: 1, PrevLogIndex: 1, PrevLogTerm: 0, Entries: nil, LeaderCommit: 0,
+		}, reply)
+		if reply.Success {
+			t.Fatal("PrevLogIndex beyond log should fail")
+		}
+
+		reply2 := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term: 1, PrevLogIndex: 0, PrevLogTerm: 99, Entries: nil, LeaderCommit: 0,
+		}, reply2)
+		if reply2.Success {
+			t.Fatal("PrevLogTerm mismatch should fail")
+		}
+	})
+
+	t.Run("append_entries_non_empty_entries_rejected_until_replication", func(t *testing.T) {
+		rf := unitTestNewRaft(t, 3, 0)
+		rf.mu.Lock()
+		rf.currentTerm = 2
+		rf.role = RoleFollower
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		rf.AppendEntries(&AppendEntriesArgs{
+			Term: 2, PrevLogIndex: 0, PrevLogTerm: 0,
+			Entries:      []LogEntry{{Term: 2, Command: 1}},
+			LeaderCommit: 0,
+		}, reply)
+		if reply.Success {
+			t.Fatal("non-empty Entries should be rejected until log append is implemented")
+		}
+	})
 }
 
 // TestPeer_Part4 integration: ticker + election + leader heartbeats (stable cluster).
