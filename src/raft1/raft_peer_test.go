@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"testing"
@@ -459,6 +460,15 @@ func raftServerName(i int) string {
 	return fmt.Sprintf("raft-server-%d", i)
 }
 
+// rpcTotalIncoming sums labrpc.Server incoming RPC counts for each Raft server (Phần 13).
+func rpcTotalIncoming(net *labrpc.Network, n int) int {
+	tot := 0
+	for i := 0; i < n; i++ {
+		tot += net.GetCount(raftServerName(i))
+	}
+	return tot
+}
+
 // unitTestDisconnectPeer disables all ClientEnds to/from peer pid (same idea as tester ServerGrp.DisconnectAll).
 func unitTestDisconnectPeer(net *labrpc.Network, n, pid int) {
 	for k := 0; k < n; k++ {
@@ -473,6 +483,53 @@ func unitTestReconnectPeer(net *labrpc.Network, n, pid int) {
 		net.Enable(fmt.Sprintf("End-%d-to-%d", k, pid), true)
 		net.Enable(fmt.Sprintf("End-%d-to-%d", pid, k), true)
 	}
+}
+
+// unitTestConnectSubset enables bidirectional links between every pair in peers (clique only).
+// Use this instead of unitTestReconnectPeer when other peers must stay fully isolated (matches
+// tester ConnectOne semantics: no accidental link to a disconnected peer).
+func unitTestConnectSubset(net *labrpc.Network, n int, peers []int) {
+	for a := 0; a < len(peers); a++ {
+		for b := a + 1; b < len(peers); b++ {
+			i, j := peers[a], peers[b]
+			if i < 0 || i >= n || j < 0 || j >= n {
+				continue
+			}
+			net.Enable(fmt.Sprintf("End-%d-to-%d", i, j), true)
+			net.Enable(fmt.Sprintf("End-%d-to-%d", j, i), true)
+		}
+	}
+}
+
+// unitTestConnectAll enables the full mesh among all peers 0..n-1.
+func unitTestConnectAll(net *labrpc.Network, n int) {
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			if i == j {
+				continue
+			}
+			net.Enable(fmt.Sprintf("End-%d-to-%d", i, j), true)
+		}
+	}
+}
+
+// waitLeaderInSubset waits until some peer in subset reports isLeader (partition-aware leader check).
+func waitLeaderInSubset(tb testing.TB, rafs []*Raft, subset []int, maxWait time.Duration) int {
+	tb.Helper()
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		for _, i := range subset {
+			if i < 0 || i >= len(rafs) {
+				continue
+			}
+			if _, isL := rafs[i].GetState(); isL {
+				return i
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	tb.Fatal("timeout: no leader among subset", subset)
+	return -1
 }
 
 // waitAtLeastNCommit waits until at least `atLeast` peers have commitIndex >= want.
@@ -495,6 +552,38 @@ func waitAtLeastNCommit(tb testing.TB, rafs []*Raft, want, atLeast int) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	tb.Fatalf("timeout: want >=%d peers with commitIndex>=%d", atLeast, want)
+}
+
+// waitAtLeastNCommitSubset counts only peers in indices (for partitioned clusters).
+func waitAtLeastNCommitSubset(tb testing.TB, rafs []*Raft, peerIdx []int, want int, atLeast int) {
+	tb.Helper()
+	waitAtLeastNCommitSubsetFor(tb, rafs, peerIdx, want, atLeast, 45*time.Second)
+}
+
+// waitAtLeastNCommitSubsetFor is like waitAtLeastNCommitSubset but with a custom wait budget.
+func waitAtLeastNCommitSubsetFor(tb testing.TB, rafs []*Raft, peerIdx []int, want int, atLeast int, budget time.Duration) {
+	tb.Helper()
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		n := 0
+		for _, pi := range peerIdx {
+			if pi < 0 || pi >= len(rafs) {
+				continue
+			}
+			rf := rafs[pi]
+			rf.mu.Lock()
+			ci := rf.commitIndex
+			rf.mu.Unlock()
+			if ci >= want {
+				n++
+			}
+		}
+		if n >= atLeast {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	tb.Fatalf("timeout: want >=%d among %v with commitIndex>=%d", atLeast, peerIdx, want)
 }
 
 // assertMaxCommitIndex asserts no peer has commitIndex > maxWant (3B Part 7 — no commit past quorum).
@@ -1228,6 +1317,586 @@ func TestPeer_3B_Part7_LeaderChainDisconnect(t *testing.T) {
 	assertMaxCommitIndex(t, rafs, 3)
 }
 
+// findLeaderRaftSkip returns a *Raft that believes it is leader, ignoring peer skip (partition / stale leader).
+func findLeaderRaftSkip(rafs []*Raft, skip int) *Raft {
+	for i, rf := range rafs {
+		if i == skip {
+			continue
+		}
+		if _, isL := rf.GetState(); isL {
+			return rf
+		}
+	}
+	return nil
+}
+
+// findLeaderIndexSkip returns the index of a peer that believes it is leader (skip < 0 means no skip).
+func findLeaderIndexSkip(rafs []*Raft, skip int) int {
+	for i, rf := range rafs {
+		if skip >= 0 && i == skip {
+			continue
+		}
+		if _, isL := rf.GetState(); isL {
+			return i
+		}
+	}
+	return -1
+}
+
+// tryStartOnAnyLeaderExceptSkip tries Start on a leader among peers with index != skip.
+func tryStartOnAnyLeaderExceptSkip(tb testing.TB, rafs []*Raft, skip int, cmd interface{}) (int, bool) {
+	tb.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		for i, rf := range rafs {
+			if i == skip {
+				continue
+			}
+			if _, isL := rf.GetState(); isL {
+				idx, _, ok := rf.Start(cmd)
+				if ok {
+					return idx, true
+				}
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	return -1, false
+}
+
+// tryStartAllPeers mirrors tester one() retry: any leader may accept Start.
+func tryStartUntilOk(tb testing.TB, rafs []*Raft, cmd interface{}) bool {
+	tb.Helper()
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, rf := range rafs {
+			if _, isL := rf.GetState(); isL {
+				if _, _, ok := rf.Start(cmd); ok {
+					return true
+				}
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	return false
+}
+
+// tryStartOnAnyLeaderReturnsIndex returns the log index from the first successful Start on a leader.
+func tryStartOnAnyLeaderReturnsIndex(tb testing.TB, rafs []*Raft, cmd interface{}) (int, bool) {
+	tb.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, rf := range rafs {
+			if _, isL := rf.GetState(); isL {
+				idx, _, ok := rf.Start(cmd)
+				if ok {
+					return idx, true
+				}
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	return -1, false
+}
+
+// tryStartLeaderInSubset tries Start on each peer in peerIdx (like Test.one): followers return
+// ok=false quickly. Skips stale isolated "leaders" by not calling peers outside peerIdx.
+func tryStartLeaderInSubset(tb testing.TB, rafs []*Raft, peerIdx []int, cmd interface{}) (int, bool) {
+	tb.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, pi := range peerIdx {
+			if pi < 0 || pi >= len(rafs) {
+				continue
+			}
+			rf := rafs[pi]
+			if idx, _, ok := rf.Start(cmd); ok {
+				return idx, true
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	return -1, false
+}
+
+// TestPeer_3B_Part8_FollowerReconnectAgree mirrors TestFailAgree3B (TDD Phần 8).
+func TestPeer_3B_Part8_FollowerReconnectAgree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, net := unitTestRaftCluster(t, 3)
+	waitSingleLeader(t, rafs, 5*time.Second)
+
+	if _, _, ok := findLeaderRaftSkip(rafs, -1).Start(101); !ok {
+		t.Fatal("Start(101)")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 1)
+
+	leaderIdx := -1
+	for i, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leaderIdx = i
+			break
+		}
+	}
+	if leaderIdx < 0 {
+		t.Fatal("no leader")
+	}
+	partitioned := (leaderIdx + 1) % 3
+	unitTestDisconnectPeer(net, 3, partitioned)
+
+	cmds := []int{102, 103, 104, 105}
+	for i, cmd := range cmds {
+		lf := findLeaderRaftSkip(rafs, partitioned)
+		if lf == nil {
+			t.Fatalf("no leader (skip %d) before Start(%d)", partitioned, cmd)
+		}
+		if _, _, ok := lf.Start(cmd); !ok {
+			t.Fatalf("Start(%d)", cmd)
+		}
+		waitAtLeastNCommit(t, rafs, i+2, 2)
+		if cmd == 103 {
+			time.Sleep(RaftElectionTimeout)
+		}
+	}
+
+	unitTestReconnectPeer(net, 3, partitioned)
+	waitAllServersCommitAtLeast(t, rafs, 5)
+
+	if !tryStartUntilOk(t, rafs, 106) {
+		t.Fatal("Start(106) failed on any leader")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 6)
+	time.Sleep(RaftElectionTimeout)
+	if !tryStartUntilOk(t, rafs, 107) {
+		t.Fatal("Start(107) failed on any leader")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 7)
+}
+
+// TestPeer_3B_Part9_NoQuorumFivePeers mirrors TestFailNoAgree3B (TDD Phần 9).
+func TestPeer_3B_Part9_NoQuorumFivePeers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	const n = 5
+	rafs, net := unitTestRaftCluster(t, n)
+	waitSingleLeader(t, rafs, 8*time.Second)
+
+	lf := findLeaderRaftSkip(rafs, -1)
+	if lf == nil {
+		t.Fatal("no leader")
+	}
+	if _, _, ok := lf.Start(10); !ok {
+		t.Fatal("Start(10)")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 1)
+
+	leader := -1
+	for i, rf := range rafs {
+		if _, isL := rf.GetState(); isL {
+			leader = i
+			break
+		}
+	}
+	if leader < 0 {
+		t.Fatal("no leader index")
+	}
+	for _, off := range []int{1, 2, 3} {
+		unitTestDisconnectPeer(net, n, (leader+off)%n)
+	}
+
+	idx, _, ok := rafs[leader].Start(20)
+	if !ok {
+		t.Fatal("leader rejected Start(20)")
+	}
+	if idx != 2 {
+		t.Fatalf("expected index 2, got %d", idx)
+	}
+	time.Sleep(2 * RaftElectionTimeout)
+	assertMaxCommitIndex(t, rafs, 1)
+
+	for _, off := range []int{1, 2, 3} {
+		unitTestReconnectPeer(net, n, (leader+off)%n)
+	}
+	time.Sleep(RaftElectionTimeout)
+
+	leader2 := -1
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		found := false
+		for i, rf := range rafs {
+			if _, isL := rf.GetState(); isL {
+				leader2 = i
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if leader2 < 0 {
+		t.Fatal("no leader after repair")
+	}
+	i2, _, ok2 := rafs[leader2].Start(30)
+	if !ok2 {
+		t.Fatal("Start(30)")
+	}
+	if i2 < 2 || i2 > 3 {
+		t.Fatalf("unexpected index %v (want 2 or 3)", i2)
+	}
+
+	idx1000, ok3 := tryStartOnAnyLeaderReturnsIndex(t, rafs, 1000)
+	if !ok3 {
+		t.Fatal("Start(1000) failed")
+	}
+	waitAllServersCommitAtLeast(t, rafs, idx1000)
+}
+
+// TestPeer_3B_Part10_ConcurrentStarts mirrors TestConcurrentStarts3B (TDD Phần 10).
+func TestPeer_3B_Part10_ConcurrentStarts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, _ := unitTestRaftCluster(t, 3)
+
+	for try := 0; try < 5; try++ {
+		if try > 0 {
+			time.Sleep(3 * time.Second)
+		}
+		waitSingleLeader(t, rafs, 5*time.Second)
+
+		leader := -1
+		for i, rf := range rafs {
+			if _, isL := rf.GetState(); isL {
+				leader = i
+				break
+			}
+		}
+		if leader < 0 {
+			t.Fatal("no leader")
+		}
+		lr := rafs[leader]
+
+		_, term, ok := lr.Start(1)
+		if !ok {
+			continue
+		}
+
+		const iters = 5
+		var wg sync.WaitGroup
+		idxs := make([]int, iters)
+		oks := make([]bool, iters)
+		terms := make([]int, iters)
+		for i := 0; i < iters; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				idx, tm, ok := lr.Start(100 + i)
+				idxs[i] = idx
+				terms[i] = tm
+				oks[i] = ok
+			}(i)
+		}
+		wg.Wait()
+
+		termChanged := false
+		for j := range rafs {
+			tnow, _ := rafs[j].GetState()
+			if tnow != term {
+				termChanged = true
+				break
+			}
+		}
+		if termChanged {
+			continue
+		}
+
+		allOK := true
+		for i := 0; i < iters; i++ {
+			if !oks[i] || terms[i] != term {
+				allOK = false
+				break
+			}
+		}
+		if !allOK {
+			continue
+		}
+
+		seen := make(map[int]struct{})
+		for i := 0; i < iters; i++ {
+			seen[idxs[i]] = struct{}{}
+		}
+		if len(seen) != iters {
+			t.Fatalf("duplicate indices: %v", idxs)
+		}
+		for _, v := range idxs {
+			if v < 2 || v > 6 {
+				t.Fatalf("index %v out of range [2,6]: %v", v, idxs)
+			}
+		}
+
+		waitAllServersCommitAtLeast(t, rafs, 6)
+		return
+	}
+	t.Fatal("term changed too often (concurrent Start)")
+}
+
+// TestPeer_3B_Part11_RejoinPartitionedLeader mirrors TestRejoin3B (TDD Phần 11).
+func TestPeer_3B_Part11_RejoinPartitionedLeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	rafs, net := unitTestRaftCluster(t, 3)
+	waitSingleLeader(t, rafs, 6*time.Second)
+
+	if !tryStartUntilOk(t, rafs, 101) {
+		t.Fatal("Start(101)")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 1)
+
+	leader1 := findLeaderIndexSkip(rafs, -1)
+	if leader1 < 0 {
+		t.Fatal("no leader")
+	}
+	unitTestDisconnectPeer(net, 3, leader1)
+	rafs[leader1].Start(102)
+	rafs[leader1].Start(103)
+	rafs[leader1].Start(104)
+
+	time.Sleep(RaftElectionTimeout)
+	lf := findLeaderRaftSkip(rafs, leader1)
+	if lf == nil {
+		t.Fatal("no leader in majority partition")
+	}
+	idx103, _, ok := lf.Start(103)
+	if !ok {
+		t.Fatal("Start(103) on majority partition")
+	}
+	maj103 := make([]int, 0, 2)
+	for i := range rafs {
+		if i != leader1 {
+			maj103 = append(maj103, i)
+		}
+	}
+	waitAtLeastNCommitSubset(t, rafs, maj103, idx103, 2)
+
+	leader2 := findLeaderIndexSkip(rafs, leader1)
+	if leader2 < 0 {
+		t.Fatal("no leader in majority partition")
+	}
+	third := -1
+	for i := range rafs {
+		if i != leader1 && i != leader2 {
+			third = i
+			break
+		}
+	}
+	if third < 0 {
+		t.Fatal("no third peer")
+	}
+	unitTestDisconnectPeer(net, 3, leader2)
+	// Only old leader + third (not leader2): same as tester ConnectOne(leader1) with leader2 disconnected.
+	unitTestConnectSubset(net, 3, []int{leader1, third})
+	time.Sleep(RaftElectionTimeout)
+
+	lf2 := findLeaderRaftSkip(rafs, leader2)
+	if lf2 == nil {
+		t.Fatal("no leader after old leader rejoin")
+	}
+	idx104, _, ok := lf2.Start(104)
+	if !ok {
+		t.Fatal("Start(104) after old leader rejoin")
+	}
+	maj104 := make([]int, 0, 2)
+	for i := range rafs {
+		if i != leader2 {
+			maj104 = append(maj104, i)
+		}
+	}
+	waitAtLeastNCommitSubset(t, rafs, maj104, idx104, 2)
+
+	unitTestConnectAll(net, 3)
+
+	idx105, ok := tryStartOnAnyLeaderReturnsIndex(t, rafs, 105)
+	if !ok {
+		t.Fatal("Start(105)")
+	}
+	waitAllServersCommitAtLeast(t, rafs, idx105)
+}
+
+// TestPeer_3B_Part12_BackupPartitionMerge mirrors TestBackup3B with smaller batches (TDD Phần 12).
+func TestPeer_3B_Part12_BackupPartitionMerge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	const servers = 5
+	const batch = 20 // course uses 50; still exercises fast backup / conflict
+	rafs, net := unitTestRaftCluster(t, servers)
+	waitSingleLeader(t, rafs, 10*time.Second)
+
+	if !tryStartUntilOk(t, rafs, rand.Int()) {
+		t.Fatal("initial agreement")
+	}
+	waitAllServersCommitAtLeast(t, rafs, 1)
+
+	leader1 := findLeaderIndexSkip(rafs, -1)
+	if leader1 < 0 {
+		t.Fatal("no leader")
+	}
+	for _, off := range []int{2, 3, 4} {
+		unitTestDisconnectPeer(net, servers, (leader1+off)%servers)
+	}
+	for i := 0; i < batch; i++ {
+		rafs[leader1].Start(rand.Int())
+	}
+	time.Sleep(RaftElectionTimeout / 2)
+
+	unitTestDisconnectPeer(net, servers, (leader1+0)%servers)
+	unitTestDisconnectPeer(net, servers, (leader1+1)%servers)
+
+	part2 := []int{(leader1 + 2) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers}
+	// Clique on part2 only — do not use unitTestReconnectPeer (would re-link to isolated 0/1).
+	unitTestConnectSubset(net, servers, part2)
+	waitLeaderInSubset(t, rafs, part2, 15*time.Second)
+
+	for i := 0; i < batch; i++ {
+		idx, ok := tryStartLeaderInSubset(t, rafs, part2, rand.Int())
+		if !ok {
+			t.Fatalf("Start batch2 %d", i)
+		}
+		waitAtLeastNCommitSubset(t, rafs, part2, idx, 3)
+	}
+
+	// Match TestBackup3B: leader2 = checkOneLeader() after batch2 (leadership may have changed).
+	leader2 := waitLeaderInSubset(t, rafs, part2, 15*time.Second)
+	other := (leader1 + 2) % servers
+	if leader2 == other {
+		other = (leader2 + 1) % servers
+	}
+	unitTestDisconnectPeer(net, servers, other)
+
+	for i := 0; i < batch; i++ {
+		rafs[leader2].Start(rand.Int())
+	}
+	time.Sleep(RaftElectionTimeout / 2)
+
+	for i := 0; i < servers; i++ {
+		unitTestDisconnectPeer(net, servers, i)
+	}
+	part3 := []int{(leader1 + 0) % servers, (leader1 + 1) % servers, other}
+	unitTestConnectSubset(net, servers, part3)
+	time.Sleep(RaftElectionTimeout / 2)
+	waitLeaderInSubset(t, rafs, part3, 15*time.Second)
+
+	var lastIdx3 int
+	for i := 0; i < batch; i++ {
+		idx, ok := tryStartLeaderInSubset(t, rafs, part3, rand.Int())
+		if !ok {
+			t.Fatalf("Start batch3 %d", i)
+		}
+		lastIdx3 = idx
+	}
+	// One wait at end: per-iteration waits can starve replication under load (idx keeps growing).
+	waitAtLeastNCommitSubsetFor(t, rafs, part3, lastIdx3, 3, 120*time.Second)
+
+	unitTestConnectAll(net, servers)
+	time.Sleep(RaftElectionTimeout)
+	idxFin, ok := tryStartOnAnyLeaderReturnsIndex(t, rafs, rand.Int())
+	if !ok {
+		t.Fatal("final Start")
+	}
+	// After full mesh, stragglers need time to align logs (backup test uses large index).
+	waitAllServersCommitAtLeastFor(t, rafs, idxFin, 90*time.Second)
+}
+
+// TestPeer_3B_Part13_RPCCount mirrors TestCount3B RPC / index checks (TDD Phần 13).
+func TestPeer_3B_Part13_RPCCount(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cluster uses real time")
+	}
+	t.Parallel()
+
+	const servers = 3
+	const iters = 10
+	rafs, net := unitTestRaftCluster(t, servers)
+	waitSingleLeader(t, rafs, 6*time.Second)
+
+	leader := findLeaderIndexSkip(rafs, -1)
+	if leader < 0 {
+		t.Fatal("no leader")
+	}
+	total0 := rpcTotalIncoming(net, servers)
+	if total0 > 30 || total0 < 1 {
+		t.Fatalf("initial RPC count %d want in [1,30]", total0)
+	}
+
+loop:
+	for try := 0; try < 5; try++ {
+		if try > 0 {
+			time.Sleep(3 * time.Second)
+		}
+		leader = findLeaderIndexSkip(rafs, -1)
+		if leader < 0 {
+			continue
+		}
+		lr := rafs[leader]
+		total1 := rpcTotalIncoming(net, servers)
+		starti, term, ok := lr.Start(1)
+		if !ok {
+			continue
+		}
+		for i := 1; i < iters+2; i++ {
+			x := int(rand.Int31())
+			index1, term1, ok1 := lr.Start(x)
+			if term1 != term {
+				continue loop
+			}
+			if !ok1 {
+				continue loop
+			}
+			if starti+i != index1 {
+				t.Fatalf("wrong index: want %d got %d", starti+i, index1)
+			}
+		}
+		failed := false
+		for j := range rafs {
+			tnow, _ := rafs[j].GetState()
+			if tnow != term {
+				failed = true
+				break
+			}
+		}
+		if failed {
+			continue
+		}
+		total2 := rpcTotalIncoming(net, servers)
+		if total2-total1 > (iters+1+3)*3 {
+			t.Fatalf("too many RPCs for agreement: %d > %d", total2-total1, (iters+1+3)*3)
+		}
+
+		time.Sleep(RaftElectionTimeout)
+		total3 := rpcTotalIncoming(net, servers)
+		if total3-total2 > 3*20 {
+			t.Fatalf("too many idle RPCs: %d", total3-total2)
+		}
+		return
+	}
+	t.Fatal("term changed too often (RPC count test)")
+}
+
 // TestPeer_Part4 integration: ticker + election + leader heartbeats (stable cluster).
 func TestPeer_Part4_Election(t *testing.T) {
 	if testing.Short() {
@@ -1274,7 +1943,12 @@ func TestPeer_Part4_Election(t *testing.T) {
 // waitAllServersCommitAtLeast waits until every peer has commitIndex >= want (3B Part 5/6 helpers).
 func waitAllServersCommitAtLeast(tb testing.TB, rafs []*Raft, want int) {
 	tb.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	waitAllServersCommitAtLeastFor(tb, rafs, want, 15*time.Second)
+}
+
+func waitAllServersCommitAtLeastFor(tb testing.TB, rafs []*Raft, want int, budget time.Duration) {
+	tb.Helper()
+	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
 		ok := true
 		for _, rf := range rafs {
