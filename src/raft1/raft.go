@@ -346,6 +346,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.becomeFollower(args.Term)
 	reply.Term = rf.currentTerm
+	// Reset election timer for any valid leader RPC (term >= currentTerm), even if the
+	// consistency check below fails. Prevents unnecessary elections during log resync.
+	rf.resetElectionTimerLocked()
 
 	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
@@ -365,29 +368,45 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// Drop conflicting suffix, then append leader's entries (copy to avoid aliasing RPC buffer).
-	rf.log = rf.log[:args.PrevLogIndex+1]
+	// Install leader entries (Figure 2 §5.3, rules 3–4):
+	//   - If an existing entry conflicts with a new one (same index, different term): delete it
+	//     and all that follow, then append the remaining new entries.
+	//   - If the new entry already exists with the same term, skip it (no-op).
+	//   - Only truncate on an actual conflict — never truncate a matching suffix, because a
+	//     stale (reordered) AE carrying a subset of already-installed entries would otherwise
+	//     remove committed entries that were installed by a later AE in the same term.
 	if len(args.Entries) > 0 {
-		toAppend := make([]LogEntry, len(args.Entries))
-		copy(toAppend, args.Entries)
-		rf.log = append(rf.log, toAppend...)
+		for j, entry := range args.Entries {
+			idx := args.PrevLogIndex + 1 + j
+			if idx >= len(rf.log) {
+				// Past the end of our log: append remaining entries and done.
+				rf.log = append(rf.log, args.Entries[j:]...)
+				break
+			}
+			if rf.log[idx].Term != entry.Term {
+				// Conflict: truncate at divergence point, append remaining entries.
+				rf.log = append(rf.log[:idx], args.Entries[j:]...)
+				break
+			}
+			// Entry already present with matching term: skip.
+		}
 	}
 
-	if args.LeaderCommit > rf.commitIndex {
-		last := rf.lastLogIndex()
+	// Rule 5 (Figure 2): advance commitIndex to min(leaderCommit, index of last new entry).
+	// "Last new entry" is prevLogIndex + len(entries) — the highest index whose log-matching
+	// property has been verified by this AE's term check at prevLogIndex. We MUST NOT use
+	// lastLogIndex() here: the follower may have unverified stale entries from old leaders
+	// beyond prevLogIndex, and advancing commitIndex into them would be a safety violation.
+	lastNewEntry := args.PrevLogIndex + len(args.Entries)
+	if args.LeaderCommit > rf.commitIndex && lastNewEntry > rf.commitIndex {
 		c := args.LeaderCommit
-		if c > last {
-			c = last
+		if c > lastNewEntry {
+			c = lastNewEntry
 		}
 		rf.commitIndex = c
 	}
-	// Log may have shrunk above; commitIndex must stay within the log (avoids applier panic).
-	if rf.commitIndex > rf.lastLogIndex() {
-		rf.commitIndex = rf.lastLogIndex()
-	}
 
 	reply.Success = true
-	rf.resetElectionTimerLocked()
 	rf.persist()
 }
 

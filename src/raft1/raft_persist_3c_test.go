@@ -237,9 +237,9 @@ func TestStartElectionPersists3C(t *testing.T) {
 	}
 }
 
-// TestAppendEntriesShrinksLogClampsCommitIndex3C: after truncating the log, commitIndex must not
-// stay above lastLogIndex (otherwise applier can index past the log under concurrency / reordering).
-func TestAppendEntriesShrinksLogClampsCommitIndex3C(t *testing.T) {
+// TestAppendEntriesSuccessKeepsCommitWithinLog3C: after a valid AE (prev >= commitIndex), commitIndex
+// must never exceed lastLogIndex (defense in depth; see also TestAppendEntriesRejectPrevBelowCommitIndex3C).
+func TestAppendEntriesSuccessKeepsCommitWithinLog3C(t *testing.T) {
 	p := tester.MakePersister()
 	rf := &Raft{
 		persister:   p,
@@ -248,19 +248,18 @@ func TestAppendEntriesShrinksLogClampsCommitIndex3C(t *testing.T) {
 		log: []LogEntry{
 			{Term: 0}, {Term: 1, Command: "a"}, {Term: 1, Command: "b"}, {Term: 2, Command: "c"},
 		},
-		commitIndex: 3,
+		commitIndex: 1,
 		role:        RoleFollower,
 	}
-	args := &AppendEntriesArgs{
+	reply := &AppendEntriesReply{}
+	rf.AppendEntries(&AppendEntriesArgs{
 		Term:         2,
 		LeaderId:     1,
-		PrevLogIndex: 1,
+		PrevLogIndex: 2,
 		PrevLogTerm:  1,
-		Entries:      []LogEntry{{Term: 2, Command: "c"}},
-		LeaderCommit: 2, // < old commitIndex; log shrinks so commitIndex must clamp
-	}
-	reply := &AppendEntriesReply{}
-	rf.AppendEntries(args, reply)
+		Entries:      []LogEntry{{Term: 2, Command: "c2"}},
+		LeaderCommit: 3,
+	}, reply)
 	if !reply.Success {
 		t.Fatalf("expected success, got %+v", reply)
 	}

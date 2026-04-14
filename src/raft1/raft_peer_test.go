@@ -723,7 +723,11 @@ func TestPeer_3B_Part1_ReplicationState(t *testing.T) {
 func TestPeer_3B_Part2_AppendEntriesLog(t *testing.T) {
 	t.Parallel()
 
-	t.Run("prev_index_out_of_range_fails_no_timer_reset", func(t *testing.T) {
+	t.Run("prev_index_out_of_range_fails_resets_timer", func(t *testing.T) {
+		// Raft §5.2: "a server remains in follower state as long as it receives valid RPCs
+		// from a leader". Any AppendEntries with a term >= currentTerm proves there is an
+		// active leader, so the election timer must be reset even if the consistency check
+		// (PrevLogIndex/PrevLogTerm) fails. This prevents spurious elections during log resync.
 		rf := unitTestNewRaft(t, 3, 0)
 		rf.mu.Lock()
 		rf.currentTerm = 3
@@ -740,8 +744,8 @@ func TestPeer_3B_Part2_AppendEntriesLog(t *testing.T) {
 			t.Fatal("want failure when PrevLogIndex beyond log")
 		}
 		rf.mu.Lock()
-		if !rf.electionDeadline.Equal(old) {
-			t.Fatal("failed AppendEntries must not reset election timer")
+		if rf.electionDeadline.Equal(old) {
+			t.Fatal("AppendEntries from current-term leader must reset election timer even on consistency-check failure")
 		}
 		rf.mu.Unlock()
 	})

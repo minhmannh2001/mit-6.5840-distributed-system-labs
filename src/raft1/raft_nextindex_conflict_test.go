@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"6.5840/labrpc"
+	tester "6.5840/tester1"
 )
 
 // Part 4 / 3C TDD: follower conflict hints (XLen / XTerm+XIndex) and leader nextIndex backup (paper p.7–8).
@@ -163,6 +164,41 @@ func TestLeaderIgnoresStaleAppendEntriesFailure3CPart4(t *testing.T) {
 	rf.mu.Unlock()
 	if got != 10 {
 		t.Fatalf("stale failure must not move nextIndex: want 10 got %d", got)
+	}
+}
+
+func TestAppendEntriesHeartbeatPrevBelowCommitIndex3C(t *testing.T) {
+	// Reordered/stale heartbeat (empty entries) with prevLogIndex < commitIndex: since this
+	// implementation never truncates on empty AEs, the AE is safe to succeed. The log and
+	// commitIndex must remain unchanged (lastNewEntry = prevLogIndex < commitIndex, so the
+	// commitIndex advancement condition is false).
+	log := []LogEntry{{Term: 0}}
+	for i := 1; i <= 6; i++ {
+		log = append(log, LogEntry{Term: 2, Command: i})
+	}
+	rf := &Raft{
+		persister:   tester.MakePersister(),
+		currentTerm: 4,
+		commitIndex: 5,
+		log:         log,
+		role:        RoleFollower,
+	}
+	reply := &AppendEntriesReply{}
+	rf.AppendEntries(&AppendEntriesArgs{
+		Term:         4,
+		PrevLogIndex: 3,
+		PrevLogTerm:  2,
+		Entries:      nil,
+		LeaderCommit: 5,
+	}, reply)
+	if !reply.Success {
+		t.Fatalf("stale heartbeat with prevLogIndex < commitIndex should succeed (no truncation); got %+v", reply)
+	}
+	if len(rf.log) != 7 {
+		t.Fatalf("log must be unchanged: want length 7, got %d", len(rf.log))
+	}
+	if rf.commitIndex != 5 {
+		t.Fatalf("commitIndex must be unchanged: want 5, got %d", rf.commitIndex)
 	}
 }
 
