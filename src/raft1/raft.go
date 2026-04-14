@@ -239,6 +239,11 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&log) != nil {
 		return
 	}
+	// Log is always 1-indexed with a dummy at index 0 (term 0). Reject malformed blobs so
+	// Make()'s defaults are kept instead of panicking in lastLogTerm / replication.
+	if len(log) < 1 || log[0].Term != 0 {
+		return
+	}
 	rf.currentTerm = term
 	rf.votedFor = voted
 	rf.log = log
@@ -589,34 +594,44 @@ func (rf *Raft) broadcastAppendEntries() {
 					rf.advanceCommitIndexLocked()
 				}
 			} else if reply.Term == rf.currentTerm {
-				// Ignore stale failures from older RPCs (out-of-order network / concurrent AE).
-				if peer >= len(rf.nextIndex) || rf.nextIndex[peer] != args.PrevLogIndex+1 {
-					return
-				}
-				if reply.ConflictTerm < 0 {
-					rf.nextIndex[peer] = reply.ConflictIndex
-					if rf.nextIndex[peer] < 1 {
-						rf.nextIndex[peer] = 1
-					}
-				} else {
-					lastSame := 0
-					for i := len(rf.log) - 1; i > 0; i-- {
-						if rf.log[i].Term == reply.ConflictTerm {
-							lastSame = i
-							break
-						}
-					}
-					if lastSame > 0 {
-						rf.nextIndex[peer] = lastSame + 1
-					} else {
-						rf.nextIndex[peer] = reply.ConflictIndex
-					}
-					if rf.nextIndex[peer] < 1 {
-						rf.nextIndex[peer] = 1
-					}
-				}
+				rf.appendEntriesFailureUpdateNextIndexLocked(peer, args, reply)
 			}
 		}()
+	}
+}
+
+// appendEntriesFailureUpdateNextIndexLocked applies the extended-Raft log-backup optimization
+// (paper ~p.7–8, lab XTerm/XIndex/XLen): follower log too short, or term mismatch at prev.
+// Ignores stale replies where nextIndex[peer] no longer matches this RPC (out-of-order AE).
+// Caller must hold rf.mu.
+func (rf *Raft) appendEntriesFailureUpdateNextIndexLocked(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if peer >= len(rf.nextIndex) || rf.nextIndex[peer] != args.PrevLogIndex+1 {
+		return
+	}
+	// Case 3 (follower log shorter than PrevLogIndex): ConflictTerm < 0, ConflictIndex = len(log).
+	// Case 1 (leader has no ConflictTerm): nextIndex = ConflictIndex (first index of that term on follower).
+	// Case 2 (leader has ConflictTerm): nextIndex = index after leader's last entry in that term.
+	if reply.ConflictTerm < 0 {
+		rf.nextIndex[peer] = reply.ConflictIndex
+		if rf.nextIndex[peer] < 1 {
+			rf.nextIndex[peer] = 1
+		}
+		return
+	}
+	lastSame := 0
+	for i := len(rf.log) - 1; i > 0; i-- {
+		if rf.log[i].Term == reply.ConflictTerm {
+			lastSame = i
+			break
+		}
+	}
+	if lastSame > 0 {
+		rf.nextIndex[peer] = lastSame + 1
+	} else {
+		rf.nextIndex[peer] = reply.ConflictIndex
+	}
+	if rf.nextIndex[peer] < 1 {
+		rf.nextIndex[peer] = 1
 	}
 }
 
@@ -751,6 +766,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	// Initialization order (3C): set in-memory defaults first—including log[0] dummy—then
+	// overlay durable state from Persister. readPersist must not run before defaults: an empty
+	// or corrupt blob is a no-op, and we still need a valid dummy entry for Figure-2 indexing.
 	rf.currentTerm = 0
 	rf.votedFor = noVote
 	rf.role = RoleFollower

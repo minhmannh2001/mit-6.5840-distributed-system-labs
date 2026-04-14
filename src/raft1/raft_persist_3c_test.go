@@ -8,6 +8,7 @@ import (
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
+	"6.5840/raftapi"
 	tester "6.5840/tester1"
 )
 
@@ -265,5 +266,114 @@ func TestAppendEntriesShrinksLogClampsCommitIndex3C(t *testing.T) {
 	}
 	if rf.commitIndex > rf.lastLogIndex() {
 		t.Fatalf("commitIndex %d > lastLogIndex %d", rf.commitIndex, rf.lastLogIndex())
+	}
+}
+
+// --- 3C Part 3 (TDD): Make() default → readPersist → election timer; log[0] dummy invariant.
+
+func encodeRaftState3C(t *testing.T, term int, voted int, log []LogEntry) []byte {
+	t.Helper()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(term) != nil || e.Encode(voted) != nil || e.Encode(log) != nil {
+		t.Fatal("encode failed")
+	}
+	return w.Bytes()
+}
+
+// TestMakeEmptyPersisterKeepsDefaults3C: no raftstate blob → defaults from Make (including dummy log[0]).
+func TestMakeEmptyPersisterKeepsDefaults3C(t *testing.T) {
+	p := tester.MakePersister()
+	applyCh := make(chan raftapi.ApplyMsg, 64)
+	r := Make([]*labrpc.ClientEnd{nil}, 0, p, applyCh)
+	defer r.Kill()
+
+	rf := r.(*Raft)
+	rf.mu.Lock()
+	tm, vf, ln := rf.currentTerm, rf.votedFor, len(rf.log)
+	z := rf.log[0].Term
+	rf.mu.Unlock()
+	if tm != 0 || vf != noVote || ln != 1 || z != 0 {
+		t.Fatalf("want term=0 votedFor=noVote len=1 log[0].term=0; got term=%d voted=%d len=%d log0.term=%d",
+			tm, vf, ln, z)
+	}
+	term, leader := r.GetState()
+	if term != 0 || leader {
+		t.Fatalf("GetState: term=%d leader=%v want 0, false", term, leader)
+	}
+}
+
+// TestMakeReadPersistOverwritesDefaults3C: persisted state must replace defaults after Make.
+func TestMakeReadPersistOverwritesDefaults3C(t *testing.T) {
+	p := tester.MakePersister()
+	blob := encodeRaftState3C(t, 11, 2, []LogEntry{{Term: 0}, {Term: 11, Command: 99}})
+	p.Save(blob, nil)
+
+	applyCh := make(chan raftapi.ApplyMsg, 64)
+	r := Make([]*labrpc.ClientEnd{nil}, 0, p, applyCh)
+	defer r.Kill()
+
+	rf := r.(*Raft)
+	rf.mu.Lock()
+	tm, vf := rf.currentTerm, rf.votedFor
+	if len(rf.log) != 2 || rf.log[1].Term != 11 || rf.log[1].Command != 99 {
+		t.Fatalf("log got %#v", rf.log)
+	}
+	rf.mu.Unlock()
+	if tm != 11 || vf != 2 {
+		t.Fatalf("want term=11 votedFor=2; got term=%d voted=%d", tm, vf)
+	}
+	gotTerm, _ := r.GetState()
+	if gotTerm != 11 {
+		t.Fatalf("GetState term=%d want 11", gotTerm)
+	}
+}
+
+// TestReadPersistRejectsMalformedDummyLog3C: index 0 must be term 0; otherwise keep prior rf fields.
+func TestReadPersistRejectsMalformedDummyLog3C(t *testing.T) {
+	bad := encodeRaftState3C(t, 3, noVote, []LogEntry{{Term: 5, Command: "x"}})
+	rf := &Raft{
+		currentTerm: 9,
+		votedFor:    1,
+		log:         []LogEntry{{Term: 0}, {Term: 4, Command: 1}},
+	}
+	rf.readPersist(bad)
+	if rf.currentTerm != 9 || rf.votedFor != 1 || len(rf.log) != 2 {
+		t.Fatalf("expected no-op on bad dummy, got term=%d voted=%d log=%v", rf.currentTerm, rf.votedFor, rf.log)
+	}
+}
+
+// TestReadPersistRejectsEmptyDecodedLog3C: empty log slice is invalid for this Raft implementation.
+func TestReadPersistRejectsEmptyDecodedLog3C(t *testing.T) {
+	emptyLog := encodeRaftState3C(t, 1, noVote, []LogEntry{})
+	rf := &Raft{
+		currentTerm: 2,
+		votedFor:    0,
+		log:         []LogEntry{{Term: 0}},
+	}
+	rf.readPersist(emptyLog)
+	if rf.currentTerm != 2 || rf.votedFor != 0 || len(rf.log) != 1 {
+		t.Fatalf("expected defaults kept, got term=%d voted=%d log=%v", rf.currentTerm, rf.votedFor, rf.log)
+	}
+}
+
+// TestMakeWithMalformedPersistKeepsDummy3C: Make must not install a log without a valid dummy at 0.
+func TestMakeWithMalformedPersistKeepsDummy3C(t *testing.T) {
+	p := tester.MakePersister()
+	p.Save(encodeRaftState3C(t, 4, noVote, []LogEntry{{Term: 2, Command: nil}}), nil)
+
+	applyCh := make(chan raftapi.ApplyMsg, 64)
+	r := Make([]*labrpc.ClientEnd{nil}, 0, p, applyCh)
+	defer r.Kill()
+
+	rf := r.(*Raft)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if len(rf.log) != 1 || rf.log[0].Term != 0 {
+		t.Fatalf("want bootstrap dummy only, got %#v", rf.log)
+	}
+	// term/votedFor from blob should also be rejected entirely when log is bad — same guard.
+	if rf.currentTerm != 0 || rf.votedFor != noVote {
+		t.Fatalf("malformed log blob should not apply term/vote; got term=%d voted=%d", rf.currentTerm, rf.votedFor)
 	}
 }
