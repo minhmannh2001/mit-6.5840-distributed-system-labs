@@ -109,6 +109,7 @@ func (rf *Raft) becomeFollower(newTerm int) {
 	if newTerm > rf.currentTerm {
 		rf.currentTerm = newTerm
 		rf.votedFor = noVote
+		rf.persist()
 	}
 	rf.role = RoleFollower
 }
@@ -319,6 +320,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.resetElectionTimerLocked()
+		rf.persist()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -374,9 +376,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.commitIndex = c
 	}
+	// Log may have shrunk above; commitIndex must stay within the log (avoids applier panic).
+	if rf.commitIndex > rf.lastLogIndex() {
+		rf.commitIndex = rf.lastLogIndex()
+	}
 
 	reply.Success = true
 	rf.resetElectionTimerLocked()
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -440,6 +447,7 @@ func (rf *Raft) startElection() {
 	rf.role = RoleCandidate
 	rf.votedFor = rf.me
 	rf.resetElectionTimerLocked()
+	rf.persist()
 
 	term := rf.currentTerm
 	lastIdx := rf.lastLogIndex()
@@ -640,6 +648,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	idx := rf.lastLogIndex()
 	t := rf.currentTerm
 	rf.advanceCommitIndexLocked()
+	rf.persist()
 	rf.mu.Unlock()
 
 	go rf.broadcastAppendEntries()

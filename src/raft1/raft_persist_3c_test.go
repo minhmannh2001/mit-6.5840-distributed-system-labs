@@ -1,10 +1,13 @@
 package raft
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
+	"time"
 
 	"6.5840/labgob"
+	"6.5840/labrpc"
 	tester "6.5840/tester1"
 )
 
@@ -13,6 +16,19 @@ func init() {
 	labgob.Register(LogEntry{})
 	labgob.Register(0)
 	labgob.Register("")
+}
+
+func mustDecodeRaftState(t *testing.T, data []byte) (term int, voted int, log []LogEntry) {
+	t.Helper()
+	if len(data) < 1 {
+		t.Fatal("empty raftstate")
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&term) != nil || d.Decode(&voted) != nil || d.Decode(&log) != nil {
+		t.Fatal("decode raftstate failed")
+	}
+	return term, voted, log
 }
 
 // TestPersistReadPersistRoundTrip3C (3C Part 1 / TDD): encode then decode restores Figure-2 durable fields.
@@ -79,5 +95,175 @@ func TestReadPersistCorrupt3C(t *testing.T) {
 	if rf.currentTerm != beforeTerm || rf.votedFor != beforeVote || !reflect.DeepEqual(rf.log, beforeLog) {
 		t.Fatalf("corrupt blob should not change state: got term=%d vote=%d log=%v",
 			rf.currentTerm, rf.votedFor, rf.log)
+	}
+}
+
+// --- 3C Part 2 (TDD): durable state must hit Persister when RPCs / election / Start mutate it.
+
+func TestBecomeFollowerHigherTermPersists3C(t *testing.T) {
+	p := tester.MakePersister()
+	rf := &Raft{
+		persister:   p,
+		currentTerm: 2,
+		votedFor:    1,
+		log:         []LogEntry{{Term: 0}, {Term: 2, Command: nil}},
+		role:        RoleCandidate,
+	}
+	rf.mu.Lock()
+	rf.becomeFollower(5)
+	rf.mu.Unlock()
+
+	term, voted, log := mustDecodeRaftState(t, p.ReadRaftState())
+	if term != 5 || voted != noVote {
+		t.Fatalf("after term bump: term=%d votedFor=%d want term=5 votedFor=noVote", term, voted)
+	}
+	if !reflect.DeepEqual(log, rf.log) {
+		t.Fatalf("log should be unchanged, got %#v want %#v", log, rf.log)
+	}
+}
+
+func TestBecomeFollowerSameTermDoesNotWritePersister3C(t *testing.T) {
+	p := tester.MakePersister()
+	rf := &Raft{
+		persister:   p,
+		currentTerm: 3,
+		votedFor:    0,
+		log:         []LogEntry{{Term: 0}},
+		role:        RoleLeader,
+	}
+	rf.mu.Lock()
+	rf.becomeFollower(3) // demote only; Figure-2 durable fields unchanged
+	rf.mu.Unlock()
+	if len(p.ReadRaftState()) != 0 {
+		t.Fatalf("same-term becomeFollower should not persist, got %d bytes", len(p.ReadRaftState()))
+	}
+}
+
+func TestRequestVoteGrantPersists3C(t *testing.T) {
+	p := tester.MakePersister()
+	rf := &Raft{
+		persister:   p,
+		currentTerm: 1,
+		votedFor:    noVote,
+		log:         []LogEntry{{Term: 0}, {Term: 1, Command: 7}},
+		role:        RoleFollower,
+	}
+	args := &RequestVoteArgs{Term: 1, CandidateId: 2, LastLogIndex: 1, LastLogTerm: 1}
+	reply := &RequestVoteReply{}
+	rf.RequestVote(args, reply)
+	if !reply.VoteGranted {
+		t.Fatal("expected vote granted")
+	}
+	term, voted, _ := mustDecodeRaftState(t, p.ReadRaftState())
+	if term != 1 || voted != 2 {
+		t.Fatalf("persisted term=%d votedFor=%d want 1, 2", term, voted)
+	}
+}
+
+func TestAppendEntriesSuccessPersistsLog3C(t *testing.T) {
+	p := tester.MakePersister()
+	rf := &Raft{
+		persister:   p,
+		currentTerm: 2,
+		votedFor:    noVote,
+		log:         []LogEntry{{Term: 0}, {Term: 1, Command: "old"}},
+		role:        RoleFollower,
+	}
+	args := &AppendEntriesArgs{
+		Term:         2,
+		LeaderId:     1,
+		PrevLogIndex: 1,
+		PrevLogTerm:  1,
+		Entries:      []LogEntry{{Term: 2, Command: 99}},
+		LeaderCommit: 0,
+	}
+	reply := &AppendEntriesReply{}
+	rf.AppendEntries(args, reply)
+	if !reply.Success {
+		t.Fatalf("AppendEntries failed: %+v", reply)
+	}
+	_, _, log := mustDecodeRaftState(t, p.ReadRaftState())
+	want := []LogEntry{{Term: 0}, {Term: 1, Command: "old"}, {Term: 2, Command: 99}}
+	if !reflect.DeepEqual(log, want) {
+		t.Fatalf("log got %#v want %#v", log, want)
+	}
+}
+
+func TestStartLeaderPersists3C(t *testing.T) {
+	p := tester.MakePersister()
+	n := 3
+	rf := &Raft{
+		persister:   p,
+		peers:       make([]*labrpc.ClientEnd, n),
+		me:          1,
+		currentTerm: 4,
+		votedFor:    1,
+		role:        RoleLeader,
+		log:         []LogEntry{{Term: 0}, {Term: 4, Command: 1}},
+		nextIndex:   make([]int, n),
+		matchIndex:  make([]int, n),
+	}
+	for i := 0; i < n; i++ {
+		rf.nextIndex[i] = 2
+	}
+	idx, _, ok := rf.Start(200)
+	if !ok || idx != 2 {
+		t.Fatalf("Start ok=%v idx=%d want true, 2", ok, idx)
+	}
+	_, _, log := mustDecodeRaftState(t, p.ReadRaftState())
+	if len(log) != 3 || log[2].Term != 4 || log[2].Command != 200 {
+		t.Fatalf("persisted log after Start: %#v", log)
+	}
+}
+
+func TestStartElectionPersists3C(t *testing.T) {
+	p := tester.MakePersister()
+	n := 2
+	rf := &Raft{
+		persister:        p,
+		peers:            make([]*labrpc.ClientEnd, n),
+		me:               0,
+		currentTerm:      1,
+		votedFor:         noVote,
+		role:             RoleFollower,
+		log:              []LogEntry{{Term: 0}},
+		electionDeadline: time.Time{}, // always in the past → startElection proceeds
+	}
+	rf.startElection()
+	term, voted, _ := mustDecodeRaftState(t, p.ReadRaftState())
+	if term != 2 || voted != 0 {
+		t.Fatalf("after startElection: term=%d votedFor=%d want 2, 0", term, voted)
+	}
+}
+
+// TestAppendEntriesShrinksLogClampsCommitIndex3C: after truncating the log, commitIndex must not
+// stay above lastLogIndex (otherwise applier can index past the log under concurrency / reordering).
+func TestAppendEntriesShrinksLogClampsCommitIndex3C(t *testing.T) {
+	p := tester.MakePersister()
+	rf := &Raft{
+		persister:   p,
+		currentTerm: 2,
+		votedFor:    noVote,
+		log: []LogEntry{
+			{Term: 0}, {Term: 1, Command: "a"}, {Term: 1, Command: "b"}, {Term: 2, Command: "c"},
+		},
+		commitIndex: 3,
+		role:        RoleFollower,
+	}
+	args := &AppendEntriesArgs{
+		Term:         2,
+		LeaderId:     1,
+		PrevLogIndex: 1,
+		PrevLogTerm:  1,
+		Entries:      []LogEntry{{Term: 2, Command: "c"}},
+		LeaderCommit: 2, // < old commitIndex; log shrinks so commitIndex must clamp
+	}
+	reply := &AppendEntriesReply{}
+	rf.AppendEntries(args, reply)
+	if !reply.Success {
+		t.Fatalf("expected success, got %+v", reply)
+	}
+	if rf.commitIndex > rf.lastLogIndex() {
+		t.Fatalf("commitIndex %d > lastLogIndex %d", rf.commitIndex, rf.lastLogIndex())
 	}
 }
