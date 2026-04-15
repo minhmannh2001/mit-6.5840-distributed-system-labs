@@ -81,6 +81,7 @@ type Raft struct {
 	// Logical log index i is stored at rf.log[i-snapLastIdx].
 	snapLastIdx  int
 	snapLastTerm int
+	snapshot     []byte
 
 	// Volatile state on all servers (Figure 2).
 	commitIndex int // index of highest log entry known to be committed
@@ -251,8 +252,14 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.snapLastIdx)
+	e.Encode(rf.snapLastTerm)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	snapshot := rf.snapshot
+	if snapshot == nil {
+		snapshot = rf.persister.ReadSnapshot()
+	}
+	rf.persister.Save(raftstate, snapshot)
 }
 
 // restore previously persisted state.
@@ -265,10 +272,17 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	var voted int
 	var log []LogEntry
+	snapLastIdx := 0
+	snapLastTerm := 0
 	if d.Decode(&term) != nil ||
 		d.Decode(&voted) != nil ||
 		d.Decode(&log) != nil {
 		return
+	}
+	// Backward-compatible with old 3C blobs that encoded only term/vote/log.
+	if d.Decode(&snapLastIdx) != nil || d.Decode(&snapLastTerm) != nil {
+		snapLastIdx = 0
+		snapLastTerm = 0
 	}
 	// Log is always 1-indexed with a dummy at index 0 (term 0). Reject malformed blobs so
 	// Make()'s defaults are kept instead of panicking in lastLogTerm / replication.
@@ -278,6 +292,8 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.currentTerm = term
 	rf.votedFor = voted
 	rf.log = log
+	rf.snapLastIdx = snapLastIdx
+	rf.snapLastTerm = snapLastTerm
 }
 
 // how many bytes in Raft's persisted log?
@@ -838,6 +854,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = noVote
 	rf.role = RoleFollower
 	rf.log = []LogEntry{{Term: 0}}
+	rf.snapLastIdx = 0
+	rf.snapLastTerm = 0
+	rf.snapshot = persister.ReadSnapshot()
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
