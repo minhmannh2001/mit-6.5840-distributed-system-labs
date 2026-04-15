@@ -77,6 +77,11 @@ type Raft struct {
 	// log[0] is unused dummy; real entries start at 1 (3B+).
 	log []LogEntry
 
+	// 3D: last included index/term for compacted prefix; (0,0) = not compacted yet.
+	// Logical log index i is stored at rf.log[i-snapLastIdx].
+	snapLastIdx  int
+	snapLastTerm int
+
 	// Volatile state on all servers (Figure 2).
 	commitIndex int // index of highest log entry known to be committed
 	lastApplied int // index of highest log entry applied to state machine
@@ -114,14 +119,39 @@ func (rf *Raft) becomeFollower(newTerm int) {
 	rf.role = RoleFollower
 }
 
-// lastLogIndex returns index of last log entry (>= 0). Caller must hold rf.mu.
-func (rf *Raft) lastLogIndex() int {
-	return len(rf.log) - 1
+// firstLogIndex is the smallest logical index still present in rf.log[1:] (3D).
+// Caller must hold rf.mu.
+func (rf *Raft) firstLogIndex() int {
+	return rf.snapLastIdx + 1
 }
 
-// lastLogTerm returns term of last log entry. Caller must hold rf.mu.
+// logTerm returns the term of the log entry at logical index logical.
+// At snapLastIdx it returns snapLastTerm (entry may only exist in snapshot). Caller must hold rf.mu.
+func (rf *Raft) logTerm(logical int) int {
+	if logical < rf.snapLastIdx {
+		return 0
+	}
+	if logical == rf.snapLastIdx {
+		return rf.snapLastTerm
+	}
+	phy := logical - rf.snapLastIdx
+	if phy < 0 || phy >= len(rf.log) {
+		return 0
+	}
+	return rf.log[phy].Term
+}
+
+// lastLogIndex returns the logical index of the last log entry (>= 0). Caller must hold rf.mu.
+func (rf *Raft) lastLogIndex() int {
+	if len(rf.log) == 0 {
+		return rf.snapLastIdx
+	}
+	return rf.snapLastIdx + len(rf.log) - 1
+}
+
+// lastLogTerm returns the term of the last log entry. Caller must hold rf.mu.
 func (rf *Raft) lastLogTerm() int {
-	return rf.log[len(rf.log)-1].Term
+	return rf.logTerm(rf.lastLogIndex())
 }
 
 // isLogUpToDate reports whether a candidate's log is at least as current as ours (§5.4.1).
@@ -162,7 +192,7 @@ func (rf *Raft) advanceCommitIndexLocked() {
 		return
 	}
 	for n := rf.lastLogIndex(); n > rf.commitIndex; n-- {
-		if rf.log[n].Term != rf.currentTerm {
+		if rf.logTerm(n) != rf.currentTerm {
 			continue
 		}
 		cnt := 1 // this server has the entry
@@ -196,7 +226,8 @@ func (rf *Raft) applier(applyCh chan raftapi.ApplyMsg) {
 		}
 		rf.lastApplied++
 		idx := rf.lastApplied
-		cmd := rf.log[idx].Command
+		phy := idx - rf.snapLastIdx
+		cmd := rf.log[phy].Command
 		rf.mu.Unlock()
 
 		applyCh <- raftapi.ApplyMsg{
@@ -350,21 +381,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// consistency check below fails. Prevents unnecessary elections during log resync.
 	rf.resetElectionTimerLocked()
 
-	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.log) {
+	// Too short / invalid prev: same logical ConflictIndex as old code (len(rf.log)) when snapLastIdx==0.
+	if args.PrevLogIndex < 0 || args.PrevLogIndex > rf.lastLogIndex() {
 		reply.Success = false
 		reply.ConflictTerm = -1
-		reply.ConflictIndex = len(rf.log)
+		reply.ConflictIndex = rf.lastLogIndex() + 1
 		return
 	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	// Prev falls before first retained index (3D): leader needs InstallSnapshot later.
+	if args.PrevLogIndex < rf.snapLastIdx {
 		reply.Success = false
-		ct := rf.log[args.PrevLogIndex].Term
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = rf.firstLogIndex()
+		return
+	}
+	if rf.logTerm(args.PrevLogIndex) != args.PrevLogTerm {
+		reply.Success = false
+		phy := args.PrevLogIndex - rf.snapLastIdx
+		ct := rf.log[phy].Term
 		reply.ConflictTerm = ct
-		idx := args.PrevLogIndex
+		idx := phy
 		for idx > 0 && rf.log[idx-1].Term == ct {
 			idx--
 		}
-		reply.ConflictIndex = idx
+		reply.ConflictIndex = rf.snapLastIdx + idx
 		return
 	}
 
@@ -377,15 +417,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//     remove committed entries that were installed by a later AE in the same term.
 	if len(args.Entries) > 0 {
 		for j, entry := range args.Entries {
-			idx := args.PrevLogIndex + 1 + j
-			if idx >= len(rf.log) {
+			logical := args.PrevLogIndex + 1 + j
+			phy := logical - rf.snapLastIdx
+			if phy >= len(rf.log) {
 				// Past the end of our log: append remaining entries and done.
 				rf.log = append(rf.log, args.Entries[j:]...)
 				break
 			}
-			if rf.log[idx].Term != entry.Term {
+			if rf.log[phy].Term != entry.Term {
 				// Conflict: truncate at divergence point, append remaining entries.
-				rf.log = append(rf.log[:idx], args.Entries[j:]...)
+				rf.log = append(rf.log[:phy], args.Entries[j:]...)
 				break
 			}
 			// Entry already present with matching term: skip.
@@ -562,19 +603,24 @@ func (rf *Raft) broadcastAppendEntries() {
 			continue
 		}
 		next := rf.nextIndex[p]
-		if next < 1 {
-			next = 1
+		first := rf.firstLogIndex()
+		if next < first {
+			next = first
 		}
 		prev := next - 1
-		prevTerm := rf.log[prev].Term
+		prevTerm := rf.logTerm(prev)
 		// Incremental replication (3B Part 6 / TestRPCBytes3B): only append suffix log[next:],
 		// not the full log each heartbeat — nextIndex advances after successful AppendEntries.
-		rest := len(rf.log) - next
+		phyNext := next - rf.snapLastIdx
+		if phyNext < 1 {
+			phyNext = 1
+		}
+		rest := len(rf.log) - phyNext
 		if rest < 0 {
 			rest = 0
 		}
 		ents := make([]LogEntry, rest)
-		copy(ents, rf.log[next:])
+		copy(ents, rf.log[phyNext:])
 		snaps = append(snaps, aeSnap{p, &AppendEntriesArgs{
 			Term:         term,
 			PrevLogIndex: prev,
@@ -632,25 +678,25 @@ func (rf *Raft) appendEntriesFailureUpdateNextIndexLocked(peer int, args *Append
 	// Case 2 (leader has ConflictTerm): nextIndex = index after leader's last entry in that term.
 	if reply.ConflictTerm < 0 {
 		rf.nextIndex[peer] = reply.ConflictIndex
-		if rf.nextIndex[peer] < 1 {
-			rf.nextIndex[peer] = 1
+		if rf.nextIndex[peer] < rf.firstLogIndex() {
+			rf.nextIndex[peer] = rf.firstLogIndex()
 		}
 		return
 	}
-	lastSame := 0
+	lastSamePhy := 0
 	for i := len(rf.log) - 1; i > 0; i-- {
 		if rf.log[i].Term == reply.ConflictTerm {
-			lastSame = i
+			lastSamePhy = i
 			break
 		}
 	}
-	if lastSame > 0 {
-		rf.nextIndex[peer] = lastSame + 1
+	if lastSamePhy > 0 {
+		rf.nextIndex[peer] = rf.snapLastIdx + lastSamePhy + 1
 	} else {
 		rf.nextIndex[peer] = reply.ConflictIndex
 	}
-	if rf.nextIndex[peer] < 1 {
-		rf.nextIndex[peer] = 1
+	if rf.nextIndex[peer] < rf.firstLogIndex() {
+		rf.nextIndex[peer] = rf.firstLogIndex()
 	}
 }
 
