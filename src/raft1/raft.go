@@ -263,6 +263,10 @@ func (rf *Raft) applier(applyCh chan raftapi.ApplyMsg) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+//
+// Lab 3D / Phase 7: never call Save(raftstate, nil) when the persister already holds snapshot
+// bytes but rf.snapshot is nil — always fall back to ReadSnapshot() so crash recovery does not
+// wipe the k/v snapshot on disk (e.g. persist after vote-only change while in-memory pointer was cleared).
 func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -949,7 +953,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
+	// Applier/ticker observe killed() without extra locking vs persist(); lab tests do not require
+	// a final persist here — durable state is already written on each state change (3C/3D).
 }
 
 func (rf *Raft) killed() bool {
