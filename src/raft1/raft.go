@@ -48,8 +48,9 @@ const (
 	noVote = -1 // rf.votedFor when this server has not voted in currentTerm
 
 	// RPC names registered with labrpc (must match handler methods).
-	rpcRequestVote   = "Raft.RequestVote"
-	rpcAppendEntries = "Raft.AppendEntries"
+	rpcRequestVote     = "Raft.RequestVote"
+	rpcAppendEntries   = "Raft.AppendEntries"
+	rpcInstallSnapshot = "Raft.InstallSnapshot"
 
 	// Start() returns this index when not leader.
 	startIndexNotReady = -1
@@ -360,14 +361,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapLastTerm = newTerm
 	rf.snapshot = append([]byte(nil), snapshot...)
 
-	if rf.nextIndex != nil {
-		first := rf.firstLogIndex()
-		for i := range rf.nextIndex {
-			if rf.nextIndex[i] < first {
-				rf.nextIndex[i] = first
-			}
-		}
-	}
 	rf.persist()
 }
 
@@ -405,6 +398,22 @@ type AppendEntriesReply struct {
 	// Otherwise: first index in follower's log with term ConflictTerm; leader may jump nextIndex.
 	ConflictTerm  int
 	ConflictIndex int
+}
+
+// InstallSnapshot RPC arguments (Figure 13; 3D). Single RPC with full snapshot (no chunking).
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+// InstallSnapshot RPC reply.
+type InstallSnapshotReply struct {
+	Term int
 }
 
 // RequestVote RPC handler.
@@ -526,6 +535,68 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persist()
 }
 
+// InstallSnapshot (Figure 13): follower replaces compacted state with leader snapshot.
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	// Stale RPC: sender's term is behind ours — reject (no election timer reset), same idea as AppendEntries.
+	if args.Term < rf.currentTerm {
+		return
+	}
+	// Newer term: step down and adopt it; same term: this server was candidate — demote to follower for valid leader RPC.
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	} else {
+		rf.role = RoleFollower
+	}
+	reply.Term = rf.currentTerm
+	rf.resetElectionTimerLocked()
+
+	// Follower already compacted past this snapshot — idempotent ignore (still replied with current term above).
+	if args.LastIncludedIndex < rf.snapLastIdx {
+		return
+	}
+	// Same last-included index as ours: only refresh snapshot bytes (e.g. leader rewrote state at same log boundary).
+	if args.LastIncludedIndex == rf.snapLastIdx {
+		rf.snapshot = append([]byte(nil), args.Data...)
+		rf.persist()
+		return
+	}
+
+	// Newer snapshot: either keep log suffix after lastIncluded if it matches Figure 13, or discard log.
+	if args.LastIncludedIndex <= rf.lastLogIndex() && rf.logTerm(args.LastIncludedIndex) == args.LastIncludedTerm {
+		phy := args.LastIncludedIndex - rf.snapLastIdx
+		// Suffix exists and is consistent — keep entries after lastIncludedIndex only.
+		if phy >= 1 && phy < len(rf.log) {
+			trimmed := append([]LogEntry(nil), rf.log[phy+1:]...)
+			rf.log = append([]LogEntry{{Term: 0}}, trimmed...)
+		} else {
+			// Index out of slice range — treat as full replace (dummy only).
+			rf.log = []LogEntry{{Term: 0}}
+		}
+	} else {
+		// No matching entry at lastIncluded — discard entire log (Figure 13).
+		rf.log = []LogEntry{{Term: 0}}
+	}
+	rf.snapLastIdx = args.LastIncludedIndex
+	rf.snapLastTerm = args.LastIncludedTerm
+	rf.snapshot = append([]byte(nil), args.Data...)
+
+	// Do not commit or apply entries below the snapshot boundary.
+	if rf.commitIndex < args.LastIncludedIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+	if rf.lastApplied < args.LastIncludedIndex {
+		rf.lastApplied = args.LastIncludedIndex
+	}
+	if len(args.Data) > 0 {
+		rf.applySnapshotPending = true
+	}
+	rf.persist()
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -568,6 +639,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 	ok := rf.peers[server].Call(rpcAppendEntries, args, reply)
 	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	if server < 0 || server >= len(rf.peers) || rf.peers[server] == nil {
+		return false
+	}
+	return rf.peers[server].Call(rpcInstallSnapshot, args, reply)
 }
 
 // startElection begins a new election if the election deadline has passed (Figure 2).
@@ -672,15 +750,35 @@ func (rf *Raft) broadcastAppendEntries() {
 		peer int
 		args *AppendEntriesArgs
 	}
+	type isSnap struct {
+		peer int
+		args *InstallSnapshotArgs
+	}
 	var snaps []aeSnap
+	var installs []isSnap
 	for p := 0; p < n; p++ {
 		if p == me {
 			continue
 		}
 		next := rf.nextIndex[p]
 		first := rf.firstLogIndex()
+		// Follower is behind the leader's compacted prefix — AppendEntries cannot repair (next would need entries no longer in log); send full snapshot once.
 		if next < first {
-			next = first
+			snapBytes := append([]byte(nil), rf.snapshot...)
+			// In-memory snapshot may be empty right after restart while persister still holds bytes.
+			if len(snapBytes) == 0 {
+				snapBytes = append([]byte(nil), rf.persister.ReadSnapshot()...)
+			}
+			installs = append(installs, isSnap{p, &InstallSnapshotArgs{
+				Term:              term,
+				LeaderId:          me,
+				LastIncludedIndex: rf.snapLastIdx,
+				LastIncludedTerm:  rf.snapLastTerm,
+				Offset:            0,
+				Data:              snapBytes,
+				Done:              true,
+			}})
+			continue
 		}
 		prev := next - 1
 		prevTerm := rf.logTerm(prev)
@@ -705,6 +803,41 @@ func (rf *Raft) broadcastAppendEntries() {
 		}})
 	}
 	rf.mu.Unlock()
+
+	for _, ins := range installs {
+		peer := ins.peer
+		args := ins.args
+		go func() {
+			reply := &InstallSnapshotReply{}
+			if !rf.sendInstallSnapshot(peer, args, reply) {
+				return
+			}
+			if rf.killed() {
+				return
+			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			// Follower (or partition) has a newer term — step down.
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+				return
+			}
+			// Stale reply: we lost leadership or term moved on since this RPC was sent.
+			if rf.currentTerm != term || rf.role != RoleLeader {
+				return
+			}
+			lastIn := args.LastIncludedIndex
+			newNext := lastIn + 1
+			// Monotonic nextIndex — out-of-order RPC completion must not move replication backward.
+			if newNext > rf.nextIndex[peer] {
+				rf.nextIndex[peer] = newNext
+			}
+			if rf.matchIndex[peer] < lastIn {
+				rf.matchIndex[peer] = lastIn
+			}
+			rf.advanceCommitIndexLocked()
+		}()
+	}
 
 	for _, s := range snaps {
 		peer := s.peer
@@ -753,9 +886,6 @@ func (rf *Raft) appendEntriesFailureUpdateNextIndexLocked(peer int, args *Append
 	// Case 2 (leader has ConflictTerm): nextIndex = index after leader's last entry in that term.
 	if reply.ConflictTerm < 0 {
 		rf.nextIndex[peer] = reply.ConflictIndex
-		if rf.nextIndex[peer] < rf.firstLogIndex() {
-			rf.nextIndex[peer] = rf.firstLogIndex()
-		}
 		return
 	}
 	lastSamePhy := 0
@@ -769,9 +899,6 @@ func (rf *Raft) appendEntriesFailureUpdateNextIndexLocked(peer int, args *Append
 		rf.nextIndex[peer] = rf.snapLastIdx + lastSamePhy + 1
 	} else {
 		rf.nextIndex[peer] = reply.ConflictIndex
-	}
-	if rf.nextIndex[peer] < rf.firstLogIndex() {
-		rf.nextIndex[peer] = rf.firstLogIndex()
 	}
 }
 
@@ -897,6 +1024,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	labgob.Register(RequestVoteReply{})
 	labgob.Register(AppendEntriesArgs{})
 	labgob.Register(AppendEntriesReply{})
+	labgob.Register(InstallSnapshotArgs{})
+	labgob.Register(InstallSnapshotReply{})
 	// Commands in Start()/log use interface{}; register concrete types tests use.
 	labgob.Register(0)
 	labgob.Register("")
