@@ -93,6 +93,10 @@ type Raft struct {
 
 	// electionDeadline is when a follower/candidate may start a new election (3A ticker).
 	electionDeadline time.Time
+
+	// 3D Phase 4: after crash+restore, send one SnapshotValid ApplyMsg so service can sync (and
+	// unbuffered applyCh in tests still works: applier blocks until applierSnap runs).
+	applySnapshotPending bool
 }
 
 // return currentTerm and whether this server
@@ -220,6 +224,18 @@ func (rf *Raft) applier(applyCh chan raftapi.ApplyMsg) {
 			rf.mu.Unlock()
 			return
 		}
+		if rf.applySnapshotPending {
+			msg := raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      append([]byte(nil), rf.snapshot...),
+				SnapshotIndex: rf.snapLastIdx,
+				SnapshotTerm:  rf.snapLastTerm,
+			}
+			rf.applySnapshotPending = false
+			rf.mu.Unlock()
+			applyCh <- msg
+			continue
+		}
 		if rf.lastApplied >= rf.commitIndex {
 			rf.mu.Unlock()
 			time.Sleep(applierPollSleep)
@@ -308,8 +324,51 @@ func (rf *Raft) PersistBytes() int {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.killed() {
+		return
+	}
+	if snapshot == nil {
+		return
+	}
+	// Stale snapshot request (already compacted at least this far).
+	if index < rf.snapLastIdx {
+		return
+	}
+	if index > rf.commitIndex || index > rf.lastApplied {
+		return
+	}
+	if index > rf.lastLogIndex() || index < 1 {
+		return
+	}
+	phy := index - rf.snapLastIdx
+	if phy < 1 || phy >= len(rf.log) {
+		return
+	}
+	// Same last-included index: refresh snapshot bytes only.
+	if index == rf.snapLastIdx {
+		rf.snapshot = append([]byte(nil), snapshot...)
+		rf.persist()
+		return
+	}
 
+	newTerm := rf.log[phy].Term
+	trimmed := append([]LogEntry(nil), rf.log[phy+1:]...)
+	rf.log = append([]LogEntry{{Term: 0}}, trimmed...)
+	rf.snapLastIdx = index
+	rf.snapLastTerm = newTerm
+	rf.snapshot = append([]byte(nil), snapshot...)
+
+	if rf.nextIndex != nil {
+		first := rf.firstLogIndex()
+		for i := range rf.nextIndex {
+			if rf.nextIndex[i] < first {
+				rf.nextIndex[i] = first
+			}
+		}
+	}
+	rf.persist()
 }
 
 // RequestVote RPC arguments (Figure 2).
@@ -866,6 +925,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.mu.Lock()
+	// commitIndex / lastApplied are not persisted; after a snapshot+trim restart, log may
+	// start above index 1 — advance volatile indices so the applier never applies below
+	// firstLogIndex(), and optionally emit one SnapshotValid for the service layer.
+	if rf.snapLastIdx > 0 {
+		if rf.commitIndex < rf.snapLastIdx {
+			rf.commitIndex = rf.snapLastIdx
+		}
+		if rf.lastApplied < rf.snapLastIdx {
+			rf.lastApplied = rf.snapLastIdx
+		}
+		if len(rf.snapshot) > 0 {
+			rf.applySnapshotPending = true
+		}
+	}
 	rf.resetElectionTimerLocked()
 	rf.mu.Unlock()
 
