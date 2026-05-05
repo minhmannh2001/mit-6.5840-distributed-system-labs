@@ -112,6 +112,7 @@ func (rsm *RSM) reader() {
 		}
 	}
 	close(rsm.done)
+	rsm.drainPending(rpc.ErrWrongLeader)
 }
 
 // drainPending sends err to all pending Submit callers and clears the map.
@@ -149,6 +150,13 @@ func (rsm *RSM) leaderMonitor() {
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
+}
+
+// Kill shuts down the RSM by killing the underlying Raft instance.
+// Raft's applier goroutine will then close applyCh, which causes reader()
+// to exit and drain all pending Submit callers with ErrWrongLeader.
+func (rsm *RSM) Kill() {
+	rsm.rf.Kill()
 }
 
 

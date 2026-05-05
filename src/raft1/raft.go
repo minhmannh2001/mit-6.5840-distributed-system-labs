@@ -219,6 +219,7 @@ func (rf *Raft) advanceCommitIndexLocked() {
 
 // applier sends committed entries to applyCh (Figure 2). Never holds rf.mu while sending.
 func (rf *Raft) applier(applyCh chan raftapi.ApplyMsg) {
+	defer close(applyCh)
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.killed() {
