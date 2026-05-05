@@ -2,22 +2,21 @@ package rsm
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
-
+	tester "6.5840/tester1"
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
 
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	UniqueID int64
+	Req      any
 }
 
 
@@ -33,14 +32,25 @@ type StateMachine interface {
 	Restore([]byte)
 }
 
+type waitResult struct {
+	err rpc.Err
+	val any
+}
+
+type pendingOp struct {
+	uniqueID int64
+	ch       chan waitResult
+}
+
 type RSM struct {
 	mu           sync.Mutex
 	me           int
 	rf           raftapi.Raft
 	applyCh      chan raftapi.ApplyMsg
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate int
 	sm           StateMachine
-	// Your definitions here.
+	nextID       int64               // atomic, unique op ID per RSM instance
+	pending      map[int]pendingOp   // log index → waiting Submit call
 }
 
 // servers[] contains the ports of the set of
@@ -64,11 +74,34 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		pending:      make(map[int]pendingOp),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go rsm.reader()
 	return rsm
+}
+
+// reader runs in a goroutine, reading committed ops from applyCh and calling DoOp.
+// Exits when applyCh is closed (Raft killed).
+func (rsm *RSM) reader() {
+	for msg := range rsm.applyCh {
+		if !msg.CommandValid {
+			continue
+		}
+		op := msg.Command.(Op)
+		result := rsm.sm.DoOp(op.Req)
+
+		rsm.mu.Lock()
+		pw, ok := rsm.pending[msg.CommandIndex]
+		delete(rsm.pending, msg.CommandIndex)
+		rsm.mu.Unlock()
+
+		if ok {
+			pw.ch <- waitResult{err: rpc.OK, val: result}
+		}
+	}
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
@@ -76,15 +109,22 @@ func (rsm *RSM) Raft() raftapi.Raft {
 }
 
 
-// Submit a command to Raft, and wait for it to be committed.  It
-// should return ErrWrongLeader if client should find new leader and
-// try again.
+// Submit wraps req in an Op, submits to Raft, and blocks until the op is committed.
+// Returns ErrWrongLeader if this server is not the leader.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
+	id := atomic.AddInt64(&rsm.nextID, 1)
+	op := Op{UniqueID: id, Req: req}
 
-	// Submit creates an Op structure to run a command through Raft;
-	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
-	// is the argument to Submit and id is a unique id for the op.
+	index, _, isLeader := rsm.rf.Start(op)
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
 
-	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	ch := make(chan waitResult, 1)
+	rsm.mu.Lock()
+	rsm.pending[index] = pendingOp{uniqueID: id, ch: ch}
+	rsm.mu.Unlock()
+
+	result := <-ch
+	return result.err, result.val
 }
