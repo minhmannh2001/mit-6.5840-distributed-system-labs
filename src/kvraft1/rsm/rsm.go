@@ -3,6 +3,7 @@ package rsm
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
@@ -49,8 +50,9 @@ type RSM struct {
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int
 	sm           StateMachine
-	nextID       int64               // atomic, unique op ID per RSM instance
-	pending      map[int]pendingOp   // log index → waiting Submit call
+	nextID       int64             // atomic, unique op ID per RSM instance
+	pending      map[int]pendingOp // log index → waiting Submit call
+	done         chan struct{}      // closed when reader exits (Raft killed)
 }
 
 // servers[] contains the ports of the set of
@@ -75,11 +77,13 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
 		pending:      make(map[int]pendingOp),
+		done:         make(chan struct{}),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 	go rsm.reader()
+	go rsm.leaderMonitor()
 	return rsm
 }
 
@@ -99,7 +103,46 @@ func (rsm *RSM) reader() {
 		rsm.mu.Unlock()
 
 		if ok {
-			pw.ch <- waitResult{err: rpc.OK, val: result}
+			if pw.uniqueID == op.UniqueID {
+				pw.ch <- waitResult{err: rpc.OK, val: result}
+			} else {
+				// A different op was committed at this index — we lost leadership.
+				pw.ch <- waitResult{err: rpc.ErrWrongLeader}
+			}
+		}
+	}
+	close(rsm.done)
+}
+
+// drainPending sends err to all pending Submit callers and clears the map.
+// Safe to call from any goroutine. Must NOT hold rsm.mu on entry.
+func (rsm *RSM) drainPending(err rpc.Err) {
+	rsm.mu.Lock()
+	if len(rsm.pending) == 0 {
+		rsm.mu.Unlock()
+		return
+	}
+	old := rsm.pending
+	rsm.pending = make(map[int]pendingOp)
+	rsm.mu.Unlock()
+	for _, pw := range old {
+		pw.ch <- waitResult{err: err}
+	}
+}
+
+// leaderMonitor polls Raft every 10ms and drains pending if no longer leader.
+func (rsm *RSM) leaderMonitor() {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-rsm.done:
+			return
+		case <-ticker.C:
+			_, isLeader := rsm.rf.GetState()
+			if !isLeader {
+				rsm.drainPending(rpc.ErrWrongLeader)
+			}
 		}
 	}
 }
