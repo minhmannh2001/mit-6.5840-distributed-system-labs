@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 
@@ -43,13 +44,33 @@ func (kv *KVServer) DoOp(req any) any {
 	return nil
 }
 
+type kvSnapshot struct {
+	KV  map[string]string
+	Ver map[string]rpc.Tversion
+}
+
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here (for Lab 4C)
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kvSnapshot{KV: kv.kv, Ver: kv.ver})
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here (for Lab 4C)
+	if len(data) == 0 {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var snap kvSnapshot
+	if err := d.Decode(&snap); err == nil {
+		kv.kv = snap.KV
+		kv.ver = snap.Ver
+	}
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
