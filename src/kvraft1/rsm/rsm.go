@@ -91,11 +91,20 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 // Exits when applyCh is closed (Raft killed).
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh {
+		if msg.SnapshotValid {
+			rsm.sm.Restore(msg.Snapshot)
+			continue
+		}
 		if !msg.CommandValid {
 			continue
 		}
 		op := msg.Command.(Op)
 		result := rsm.sm.DoOp(op.Req)
+
+		if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
+			snap := rsm.sm.Snapshot()
+			rsm.rf.Snapshot(msg.CommandIndex, snap)
+		}
 
 		rsm.mu.Lock()
 		pw, ok := rsm.pending[msg.CommandIndex]
